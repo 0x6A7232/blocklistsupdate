@@ -42,13 +42,13 @@
 # Most current version as of this edit: 4.6.4
 
 # Supports iptables/nftables, IPv4/IPv6, multiple blocklist sources, and configurable settings
-# Version 3.0: Added CIDR aggregation, IPv6 merge control, progress bars, improved temp file cleanup
+# Version 4.0: Added CIDR merge prompts, dynamic ipset sizing, chunked ipset application, improved locking
 
 # Inspired from https://lowendspirit.com/discussion/7699/use-a-blacklist-of-bad-ips-on-your-linux-firewall-tutorial
 # Credit to user itsdeadjim ( https://lowendspirit.com/profile/itsdeadjim )
 # The original version of the script by itsdeadjim is referred to as 0.5 if it is uploaded
 
-# Load configuration file, generating it if it doesn't exist
+# Load configuration file, generating it if it doesn't exist (Modified: Added NON_INTERACTIVE_SKIP_MERGE)
 load_config() {
     CONFIG_FILE="$HOME/.blocklist.conf"
     if [ ! -f "$CONFIG_FILE" ]; then
@@ -81,6 +81,10 @@ RETRY_ATTEMPTS=3
 # Delay between retry attempts in seconds
 RETRY_DELAY=5
 
+# Disable CIDR merging for performance (y/n)
+NO_IPV4_MERGE=n
+NO_IPV6_MERGE=n
+
 # Non-interactive mode defaults (used with --non-interactive)
 # Set to 'y' or 'n' to control behavior without prompts
 NON_INTERACTIVE_EDIT_CREDENTIALS=n
@@ -88,6 +92,7 @@ NON_INTERACTIVE_LOG_IPV6=n
 NON_INTERACTIVE_CAP_HASHSIZE=n
 NON_INTERACTIVE_CONTINUE_IPTABLES=y
 NON_INTERACTIVE_CONTINUE_NO_BACKUP=n
+NON_INTERACTIVE_SKIP_MERGE=n
 EOF
         chmod 600 "$CONFIG_FILE"
     fi
@@ -115,7 +120,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Display usage information (Modified: Added --ipset-test and --no-ipv6-merge)
+# Display usage information
 show_help() {
     echo "Usage: $0 [OPTIONS]"
     echo "Options:"
@@ -128,6 +133,7 @@ show_help() {
     echo "  --log         Log output to $LOG_FILE"
     echo "  --dry-run     Simulate blocklist update without changes"
     echo "  --ipv6        Process IPv6 addresses (default: IPv4 only)"
+    echo "  --no-ipv4-merge  Disable IPv4 CIDR merging to avoid slow Bash processing, risking overlaps"
     echo "  --no-ipv6-merge  Disable IPv6 CIDR merging to avoid slow Bash processing, risking overlaps"
     echo "  --backend     Set firewall backend (iptables/nftables, default: $FIREWALL_BACKEND)"
     echo "  --non-interactive  Suppress prompts, use config defaults"
@@ -144,7 +150,7 @@ check_dependencies() {
     fi
     for cmd in $cmds; do
         if ! command -v "$cmd" >/dev/null; then
-            echo "Error: Required command '$cmd' not found"
+            echo "Error: Required command '$cmd' not found. The script may not function without it."
             exit 1
         fi
     done
@@ -153,6 +159,10 @@ check_dependencies() {
         if ! command -v "$cmd" >/dev/null; then
             if [ "$cmd" = "pv" ]; then
                 echo "Warning: 'pv' not found; progress bars for downloads, parsing, and CIDR application will not be displayed"
+            elif [ "$cmd" = "aggregate" ]; then
+                echo "Warning: 'aggregate' not found; falling back to slower Bash-based IPv4 CIDR merging. Use --no-ipv4-merge to skip."
+            elif [ "$cmd" = "aggregate6" ]; then
+                echo "Warning: 'aggregate6' not found; falling back to slower Bash-based IPv6 CIDR merging. Use --no-ipv6-merge to skip."
             else
                 echo "Warning: '$cmd' not found; some features may be limited"
             fi
@@ -656,7 +666,7 @@ merge_cidrs_bash() {
     local input_file="$1" output_file="$2"
     local cidrs=()
     local ranges=()
-    local i
+    local count=0
 
     # Read CIDRs into array
     while IFS= read -r cidr; do
@@ -664,25 +674,35 @@ merge_cidrs_bash() {
         cidrs+=("$cidr")
     done < "$input_file"
 
-    # Convert CIDRs to ranges
-    count=0
-    for cidr in "${cidrs[@]}"; do
-        read start end <<< "$(cidr_to_range "$cidr")"
-        ranges+=("$start $end $cidr")
-        count=$((count + 1))
-        [ "$DEBUG_MODE" -eq 1 ] && [ $((count % 10000)) -eq 0 ] && echo "DEBUG: Processed $count CIDRs in $input_file for merging" >&2
-    done
+    # Estimate total CIDRs for pv
+    local total_cidrs=${#cidrs[@]}
+    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Merging $total_cidrs IPv4 CIDRs" >&2
+
+    # Convert CIDRs to ranges with pv progress
+    if command -v pv >/dev/null && [ "$total_cidrs" -gt 0 ]; then
+        printf "%s\n" "${cidrs[@]}" | pv -f -N "Merging IPv4 CIDRs" -s "$total_cidrs" | while IFS= read -r cidr; do
+            read start end <<< "$(cidr_to_range "$cidr")"
+            echo "$start $end $cidr"
+            count=$((count + 1))
+            [ "$DEBUG_MODE" -eq 1 ] && [ $((count % 10000)) -eq 0 ] && echo "DEBUG: Processed $count CIDRs in $input_file for merging" >&2
+        done > "$output_file.tmp.ranges"
+    else
+        while IFS= read -r cidr; do
+            read start end <<< "$(cidr_to_range "$cidr")"
+            echo "$start $end $cidr"
+            count=$((count + 1))
+            [ "$DEBUG_MODE" -eq 1 ] && [ $((count % 10000)) -eq 0 ] && echo "DEBUG: Processed $count CIDRs in $input_file for merging" >&2
+        done < <(printf "%s\n" "${cidrs[@]}") > "$output_file.tmp.ranges"
+    fi
 
     # Sort ranges by start address
-    IFS=$'\n' sorted_ranges=($(sort -n <<< "${ranges[*]}"))
-    unset IFS
+    sort -n "$output_file.tmp.ranges" > "$output_file.tmp.sorted"
 
     # Merge overlapping ranges
     local merged=()
     local current_start current_end current_cidr
-    read current_start current_end current_cidr <<< "${sorted_ranges[0]}"
-    for range in "${sorted_ranges[@]:1}"; do
-        read start end cidr <<< "$range"
+    read current_start current_end current_cidr < "$output_file.tmp.sorted"
+    while IFS= read -r start end cidr; do
         if [ $start -le $((current_end + 1)) ]; then
             # Overlap or adjacent; extend current range if needed
             if [ $end -gt $current_end ]; then
@@ -703,12 +723,13 @@ merge_cidrs_bash() {
             current_end=$end
             current_cidr="$cidr"
         fi
-    done
+    done < <(tail -n +2 "$output_file.tmp.sorted")
     merged+=("$current_cidr")
 
     # Write merged CIDRs to output
     merged_sorted=($(printf "%s\n" "${merged[@]}" | sort -u))
     printf "%s\n" "${merged_sorted[@]}" > "$output_file"
+    rm -f "$output_file.tmp.ranges" "$output_file.tmp.sorted"
 }
 
 # Function to convert IPv6 address to decimal using bc
@@ -755,7 +776,7 @@ merge_cidrs_bash_ipv6() {
     local input_file="$1" output_file="$2"
     local cidrs=()
     local ranges=()
-    local i
+    local count=0
 
     # Read CIDRs into array
     while IFS= read -r cidr; do
@@ -763,25 +784,35 @@ merge_cidrs_bash_ipv6() {
         cidrs+=("$cidr")
     done < "$input_file"
 
-    # Convert CIDRs to ranges
-    count=0
-    for cidr in "${cidrs[@]}"; do
-        read start end <<< "$(cidr_to_range_ipv6 "$cidr")"
-        ranges+=("$start $end $cidr")
-        count=$((count + 1))
-        [ "$DEBUG_MODE" -eq 1 ] && [ $((count % 10000)) -eq 0 ] && echo "DEBUG: Processed $count CIDRs in $input_file for merging" >&2
-    done
+    # Estimate total CIDRs for pv
+    local total_cidrs=${#cidrs[@]}
+    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Merging $total_cidrs IPv6 CIDRs" >&2
+
+    # Convert CIDRs to ranges with pv progress
+    if command -v pv >/dev/null && [ "$total_cidrs" -gt 0 ]; then
+        printf "%s\n" "${cidrs[@]}" | pv -f -N "Merging IPv6 CIDRs" -s "$total_cidrs" | while IFS= read -r cidr; do
+            read start end <<< "$(cidr_to_range_ipv6 "$cidr")"
+            echo "$start $end $cidr"
+            count=$((count + 1))
+            [ "$DEBUG_MODE" -eq 1 ] && [ $((count % 10000)) -eq 0 ] && echo "DEBUG: Processed $count CIDRs in $input_file for merging" >&2
+        done > "$output_file.tmp.ranges"
+    else
+        while IFS= read -r cidr; do
+            read start end <<< "$(cidr_to_range_ipv6 "$cidr")"
+            echo "$start $end $cidr"
+            count=$((count + 1))
+            [ "$DEBUG_MODE" -eq 1 ] && [ $((count % 10000)) -eq 0 ] && echo "DEBUG: Processed $count CIDRs in $input_file for merging" >&2
+        done < <(printf "%s\n" "${cidrs[@]}") > "$output_file.tmp.ranges"
+    fi
 
     # Sort ranges by start address
-    IFS=$'\n' sorted_ranges=($(sort -n <<< "${ranges[*]}"))
-    unset IFS
+    sort -n "$output_file.tmp.ranges" > "$output_file.tmp.sorted"
 
     # Merge overlapping ranges
     local merged=()
     local current_start current_end current_cidr
-    read current_start current_end current_cidr <<< "${sorted_ranges[0]}"
-    for range in "${sorted_ranges[@]:1}"; do
-        read start end cidr <<< "$range"
+    read current_start current_end current_cidr < "$output_file.tmp.sorted"
+    while IFS= read -r start end cidr; do
         if [ $(echo "$start <= $current_end + 1" | bc) -eq 1 ]; then
             # Overlap or adjacent; extend current range if needed
             if [ $(echo "$end > $current_end" | bc) -eq 1 ]; then
@@ -802,12 +833,13 @@ merge_cidrs_bash_ipv6() {
             current_end="$end"
             current_cidr="$cidr"
         fi
-    done
+    done < <(tail -n +2 "$output_file.tmp.sorted")
     merged+=("$current_cidr")
 
     # Write merged CIDRs to output
     merged_sorted=($(printf "%s\n" "${merged[@]}" | sort -u))
     printf "%s\n" "${merged_sorted[@]}" > "$output_file"
+    rm -f "$output_file.tmp.ranges" "$output_file.tmp.sorted"
 }
 
 # Process a single blocklist
@@ -960,7 +992,7 @@ apply_rule() {
     fi
 }
 
-# Update blocklist
+# Update blocklist (Modified: Added aggregate fallback prompt, dynamic ipset chunking, ipset error logging)
 update_blocklist() {
     local dry_run="$1"
     check_sudo
@@ -993,6 +1025,63 @@ update_blocklist() {
 
     [ "$dry_run" -eq 1 ] && { echo "Dry run: Would apply $((total_cidr - dupes)) entries"; return 0; }
 
+    # Aggregate CIDRs
+    AGGREGATED_CIDR_LIST=$(mktemp /tmp/aggregated_cidr_list.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
+    AGGREGATED_CIDR_LIST_V6=$(mktemp /tmp/aggregated_cidr_list_v6.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
+    chmod 600 "$AGGREGATED_CIDR_LIST" "$AGGREGATED_CIDR_LIST_V6"
+
+    # Check for large CIDR counts without aggregate in interactive mode
+    if [ "$NO_IPV4_MERGE" != "y" ] && ! command -v aggregate >/dev/null && [ -s "$IP_LIST" ]; then
+        num_ipv4=$(grep -c '^inet' "$IP_LIST")
+        if [ "$num_ipv4" -gt 10000 ]; then
+            if [ "$NON_INTERACTIVE" -eq 0 ]; then
+                echo "Warning: 'aggregate' not found and $num_ipv4 IPv4 CIDRs detected; Bash merging may be slow"
+                read -p "Skip IPv4 merging to avoid delays (risks overlaps)? (y/N): " skip_merge
+                [[ "$skip_merge" =~ ^[Yy]$ ]] && NO_IPV4_MERGE=1
+            elif [ "$NON_INTERACTIVE_SKIP_MERGE" = "y" ]; then
+                NO_IPV4_MERGE=1
+            fi
+        fi
+    fi
+    if [ "$NO_IPV6_MERGE" != "y" ] && ! command -v aggregate6 >/dev/null && [ -s "$IP_LIST" ]; then
+        num_ipv6=$(grep -c '^inet6' "$IP_LIST")
+        if [ "$num_ipv6" -gt 10000 ]; then
+            if [ "$NON_INTERACTIVE" -eq 0 ]; then
+                echo "Warning: 'aggregate6' not found and $num_ipv6 IPv6 CIDRs detected; Bash merging may be slow"
+                read -p "Skip IPv6 merging to avoid delays (risks overlaps)? (y/N): " skip_merge_v6
+                [[ "$skip_merge_v6" =~ ^[Yy]$ ]] && NO_IPV6_MERGE=1
+            elif [ "$NON_INTERACTIVE_SKIP_MERGE" = "y" ]; then
+                NO_IPV6_MERGE=1
+            fi
+        fi
+    fi
+
+    # IPv4 aggregation
+    if [ "$NO_IPV4_MERGE" = "y" ]; then
+        grep '^inet' "$IP_LIST" | cut -d' ' -f2 > "$AGGREGATED_CIDR_LIST"
+    elif command -v aggregate >/dev/null && [ -s "$IP_LIST" ]; then
+        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | aggregate -q > "$AGGREGATED_CIDR_LIST"
+    else
+        grep '^inet' "$IP_LIST" | cut -d' ' -f2 > "$AGGREGATED_CIDR_LIST"
+        merge_cidrs_bash "$AGGREGATED_CIDR_LIST" "$AGGREGATED_CIDR_LIST.tmp"
+        mv "$AGGREGATED_CIDR_LIST.tmp" "$AGGREGATED_CIDR_LIST"
+    fi
+
+    # IPv6 aggregation
+    if [ "$IPV6_ENABLED" -eq 1 ]; then
+        if [ "$NO_IPV6_MERGE" = "y" ]; then
+            grep '^inet6' "$IP_LIST" | cut -d' ' -f2 > "$AGGREGATED_CIDR_LIST_V6"
+        elif command -v aggregate6 >/dev/null && [ -s "$IP_LIST" ]; then
+            grep '^inet6' "$IP_LIST" | cut -d' ' -f2 | aggregate6 -q > "$AGGREGATED_CIDR_LIST_V6"
+        else
+            grep '^inet6' "$IP_LIST" | cut -d' ' -f2 > "$AGGREGATED_CIDR_LIST_V6"
+            merge_cidrs_bash_ipv6 "$AGGREGATED_CIDR_LIST_V6" "$AGGREGATED_CIDR_LIST_V6.tmp"
+            mv "$AGGREGATED_CIDR_LIST_V6.tmp" "$AGGREGATED_CIDR_LIST_V6"
+        fi
+    else
+        : > "$AGGREGATED_CIDR_LIST_V6"
+    fi
+
     # Clean up existing rules
     if [ "$FIREWALL_BACKEND" = "iptables" ]; then
         [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Removing existing iptables rules" >&2
@@ -1023,17 +1112,27 @@ update_blocklist() {
         }
     fi
 
-    # Create sets
-    local hashsize="$total_cidr"
+    # Calculate total unique CIDRs after aggregation
+    num_ipv4_cidrs=$(wc -l < "$AGGREGATED_CIDR_LIST")
+    num_ipv6_cidrs=$(wc -l < "$AGGREGATED_CIDR_LIST_V6")
+    num_cidrs=$((num_ipv4_cidrs + num_ipv6_cidrs))
+    echo "Total unique CIDRs: $num_cidrs" >&2
+    
+    # Calculate hashsize (next power of 2 greater than 1.5 * num_cidrs) and maxelem
+    hashsize=$(awk -v n="$num_cidrs" 'BEGIN { n = n * 1.5; logval = log(n)/log(2); print 2^int(logval+1) }')
+    maxelem=$((num_cidrs * 2))
     [ $hashsize -lt 1024 ] && hashsize=1024
-    [ $hashsize -gt 1048576 ] && hashsize=1048576
+    [ $maxelem -lt 1024 ] && maxelem=1024
+    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Calculated hashsize=$hashsize, maxelem=$maxelem" >&2
+    
+    # Create sets with hash:net
     [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Creating ipset $IPSET_NAME with hashsize $hashsize" >&2
-    create_set inet "$IPSET_NAME" "$hashsize"
+    sudo ipset create "$IPSET_NAME" hash:net hashsize "$hashsize" family inet maxelem "$maxelem" 2>/dev/null
     [ "$IPV6_ENABLED" -eq 1 ] && {
         [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Creating ipset ${IPSET_NAME}_v6 with hashsize $hashsize" >&2
-        create_set inet6 "${IPSET_NAME}_v6" "$hashsize"
+        sudo ipset create "${IPSET_NAME}_v6" hash:net hashsize "$hashsize" family inet6 maxelem "$maxelem" 2>/dev/null
     }
-
+    
     # Populate sets
     [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Populating ipset $IPSET_NAME" >&2
     TMP_SCRIPT=$(mktemp /tmp/ipset_commands.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
@@ -1041,60 +1140,12 @@ update_blocklist() {
     echo "flush $IPSET_NAME" > "$TMP_SCRIPT"
     [ "$IPV6_ENABLED" -eq 1 ] && echo "flush ${IPSET_NAME}_v6" >> "$TMP_SCRIPT"
     cidr_count=0
-
-    # Create temporary files for CIDRs
-    TMP_CIDR_LIST=$(mktemp /tmp/cidr_list.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
-    TMP_CIDR_LIST_V6=$(mktemp /tmp/cidr_list_v6.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
-    LC_ALL=C sort "$IP_LIST" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | uniq | while IFS=' ' read -r family cidr; do
-        if [ "$family" = "inet" ]; then
-            echo "$cidr" >> "$TMP_CIDR_LIST"
-        elif [ "$family" = "inet6" ]; then
-            echo "$cidr" >> "$TMP_CIDR_LIST_V6"
-        fi
-        ((cidr_count++))
-    done
-
-    # Aggregate IPv4 CIDRs to remove overlaps
-    AGGREGATED_CIDR_LIST=$(mktemp /tmp/aggregated_cidr_list.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
-    if [ -s "$TMP_CIDR_LIST" ]; then
-        if command -v aggregate >/dev/null; then
-            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Using aggregate to merge IPv4 CIDRs" >&2
-            aggregate -q < "$TMP_CIDR_LIST" > "$AGGREGATED_CIDR_LIST"
-        else
-            echo "Warning: 'aggregate' not found; falling back to Bash CIDR merge for IPv4 (may be slower)"
-            merge_cidrs_bash "$TMP_CIDR_LIST" "$AGGREGATED_CIDR_LIST"
-        fi
-    else
-        : > "$AGGREGATED_CIDR_LIST"
-    fi
-
-    # Aggregate IPv6 CIDRs if enabled and not disabled
-    AGGREGATED_CIDR_LIST_V6=$(mktemp /tmp/aggregated_cidr_list_v6.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
-    if [ "$IPV6_ENABLED" -eq 1 ] && [ -s "$TMP_CIDR_LIST_V6" ]; then
-        if [ "$NO_IPV6_MERGE" -eq 0 ]; then
-            if command -v aggregate6 >/dev/null; then
-                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Using aggregate6 to merge IPv6 CIDRs" >&2
-                aggregate6 < "$TMP_CIDR_LIST_V6" > "$AGGREGATED_CIDR_LIST_V6"
-            else
-                echo "Warning: 'aggregate6' not found; falling back to Bash CIDR merge for IPv6 (may be slower)"
-                merge_cidrs_bash_ipv6 "$TMP_CIDR_LIST_V6" "$AGGREGATED_CIDR_LIST_V6"
-            fi
-        else
-            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping IPv6 CIDR merge due to --no-ipv6-merge" >&2
-            cp "$TMP_CIDR_LIST_V6" "$AGGREGATED_CIDR_LIST_V6"
-        fi
-    else
-        : > "$AGGREGATED_CIDR_LIST_V6"
-    fi
-
+    
     # Add aggregated CIDRs to ipset commands with pv progress
     if command -v pv >/dev/null; then
-        # Count total CIDRs for pv
-        local total_ipv4_cidrs=$(wc -l < "$AGGREGATED_CIDR_LIST")
-        local total_ipv6_cidrs=$(wc -l < "$AGGREGATED_CIDR_LIST_V6")
         # IPv4 CIDRs
         if [ -s "$AGGREGATED_CIDR_LIST" ]; then
-            pv -f -N "Applying IPv4 CIDRs to $IPSET_NAME" -s "$total_ipv4_cidrs" "$AGGREGATED_CIDR_LIST" | while IFS= read -r cidr; do
+            pv -f -N "Applying IPv4 CIDRs to $IPSET_NAME" -s "$num_ipv4_cidrs" "$AGGREGATED_CIDR_LIST" | while IFS= read -r cidr; do
                 [ -z "$cidr" ] && continue
                 if [ "$IPSET_TEST" -eq 1 ] && sudo ipset test "$IPSET_NAME" "$cidr" 2>/dev/null; then
                     [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping duplicate IPv4 CIDR $cidr in $IPSET_NAME" >&2
@@ -1106,7 +1157,7 @@ update_blocklist() {
         fi
         # IPv6 CIDRs
         if [ "$IPV6_ENABLED" -eq 1 ] && [ -s "$AGGREGATED_CIDR_LIST_V6" ]; then
-            pv -f -N "Applying IPv6 CIDRs to ${IPSET_NAME}_v6" -s "$total_ipv6_cidrs" "$AGGREGATED_CIDR_LIST_V6" | while IFS= read -r cidr; do
+            pv -f -N "Applying IPv6 CIDRs to ${IPSET_NAME}_v6" -s "$num_ipv6_cidrs" "$AGGREGATED_CIDR_LIST_V6" | while IFS= read -r cidr; do
                 [ -z "$cidr" ] && continue
                 if [ "$IPSET_TEST" -eq 1 ] && sudo ipset test "${IPSET_NAME}_v6" "$cidr" 2>/dev/null; then
                     [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping duplicate IPv6 CIDR $cidr in ${IPSET_NAME}_v6" >&2
@@ -1140,69 +1191,60 @@ update_blocklist() {
         fi
     fi
 
-    # Clean up temporary CIDR lists
-    rm -f "$TMP_CIDR_LIST" "$TMP_CIDR_LIST_V6" "$AGGREGATED_CIDR_LIST" "$AGGREGATED_CIDR_LIST_V6"
-
-    # Check for previous ipset error log and display surrounding lines if it exists
-    if [ "$DEBUG_MODE" -eq 1 ]; then
-        script_name=$(basename "$0" .sh)
-        ipset_log="${script_name}_ipset.log"
-        if [ -f "$ipset_log" ]; then
-            error_line=$(grep '^Error line:' "$ipset_log" | sed 's/Error line: //')
-            if [ -n "$error_line" ]; then
-                start_line=$((error_line - 5))
-                end_line=$((error_line + 5))
-                [ $start_line -lt 1 ] && start_line=1
-                echo "DEBUG: Previous ipset error detected at line $error_line; showing lines $start_line-$end_line from $TMP_SCRIPT:" >&2
-                sed -n "${start_line},${end_line}p" "$TMP_SCRIPT" >&2
-            fi
-        fi
-    fi
-
-    # Apply sets
+    # Apply sets with fallback
     echo "Applying $((total_cidr - dupes)) unique entries"
-    # Capture ipset restore output to check for errors
     ipset_output=$(sudo ipset restore < "$TMP_SCRIPT" 2>&1)
     ipset_status=$?
     if [ $ipset_status -ne 0 ]; then
-        echo "Failed to apply set; restoring backup"
-        # Extract the line number from ipset error message
-        error_line=$(echo "$ipset_output" | grep -o 'Error in line [0-9]*' | sed 's/Error in line //')
-        if [ -n "$error_line" ] && [ "$DEBUG_MODE" -eq 1 ]; then
-            # Create log file with script name
-            script_name=$(basename "$0" .sh)
-            ipset_log="${script_name}_ipset.log"
-            # Overwrite log file with explanation and line number
-            cat > "$ipset_log" << EOF
-# This file was created because ipset reported an error: duplicate CIDR detected.
-# The error occurred at line $error_line in the temporary ipset script.
-# To see the surrounding lines and identify the duplicate, rerun the script with:
-#   $0 --debug
-Error line: $error_line
-EOF
-            chmod 600 "$ipset_log"
-            echo "DEBUG: ipset error detected at line $error_line; details logged to $ipset_log" >&2
-            echo "DEBUG: Rerun with --debug to display the surrounding lines and identify the duplicate" >&2
-        fi
-        if [ -s "$IPSET_BACKUP_FILE" ]; then
-            if [ "$FIREWALL_BACKEND" = "iptables" ] && sudo ipset restore < "$IPSET_BACKUP_FILE" 2>/dev/null; then
-                echo "Restored previous state"
-                apply_rule inet "$IPSET_NAME"
-                [ "$IPV6_ENABLED" -eq 1 ] && apply_rule inet6 "${IPSET_NAME}_v6"
-                exit 1
-            else
-                echo "Failed to restore backup"
+        echo "Failed to apply set: $ipset_output" | tee -a "$LOG_FILE"
+        echo "Failed to apply set; attempting fallback..."
+        # Split commands into chunks with dynamic sizing
+        chunk_size=100000
+        attempts=0
+        max_attempts=3
+        while [ $ipset_status -ne 0 ] && [ $attempts -lt $max_attempts ]; do
+            echo "Failed to apply set; attempting fallback with chunk size $chunk_size..." | tee -a "$LOG_FILE"
+            split -l "$chunk_size" "$TMP_SCRIPT" ipset_chunk_
+            sudo ipset destroy "$IPSET_NAME" 2>/dev/null
+            [ "$IPV6_ENABLED" -eq 1 ] && sudo ipset destroy "${IPSET_NAME}_v6" 2>/dev/null
+            sudo ipset create "$IPSET_NAME" hash:net hashsize "$hashsize" family inet maxelem "$maxelem" 2>/dev/null
+            [ "$IPV6_ENABLED" -eq 1 ] && sudo ipset create "${IPSET_NAME}_v6" hash:net hashsize "$hashsize" family inet6 maxelem "$maxelem" 2>/dev/null
+            for chunk in ipset_chunk_*; do
+                ipset_output=$(sudo ipset restore < "$chunk" 2>&1)
+                ipset_status=$?
+                if [ $ipset_status -ne 0 ]; then
+                    echo "Failed to apply chunk $chunk: $ipset_output" | tee -a "$LOG_FILE"
+                    break
+                fi
+            done
+            rm ipset_chunk_*
+            attempts=$((attempts + 1))
+            chunk_size=$((chunk_size / 2))
+            [ $chunk_size -lt 1000 ] && chunk_size=1000
+        done
+        if [ $ipset_status -ne 0 ]; then
+            echo "Failed to apply set after $max_attempts attempts; restoring backup..." | tee -a "$LOG_FILE"
+            if [ -s "$IPSET_BACKUP_FILE" ]; then
+                if sudo ipset restore < "$IPSET_BACKUP_FILE" 2>/dev/null; then
+                    echo "Restored previous state"
+                    apply_rule inet "$IPSET_NAME"
+                    [ "$IPV6_ENABLED" -eq 1 ] && apply_rule inet6 "${IPSET_NAME}_v6"
+                    rm "$TMP_SCRIPT"
+                    exit 1
+                else
+                    echo "Failed to restore backup" | tee -a "$LOG_FILE"
+                fi
             fi
+            if [ "$NON_INTERACTIVE" -eq 1 ]; then
+                [ "$NON_INTERACTIVE_CONTINUE_NO_BACKUP" = "y" ] && { echo "Proceeding without blacklist"; rm "$TMP_SCRIPT"; exit 0; }
+            else
+                read -p "Exit without applying blacklist? (y/N): " continue_no_backup
+                [[ "$continue_no_backup" =~ ^[Yy]$ ]] && { echo "Proceeding without blacklist"; rm "$TMP_SCRIPT"; exit 0; }
+            fi
+            rm "$TMP_SCRIPT"
+            exit 1
         fi
-        if [ "$NON_INTERACTIVE" -eq 1 ]; then
-            [ "$NON_INTERACTIVE_CONTINUE_NO_BACKUP" = "y" ] && { echo "Proceeding without blacklist"; exit 0; }
-        else
-            read -p "Exit without applying blacklist? (y/N): " continue_no_backup
-            [[ "$continue_no_backup" =~ ^[Yy]$ ]] && { echo "Proceeding without blacklist"; exit 0; }
-        fi
-        exit 1
     else
-        # ipset restore succeeded; clean up diagnostic log if it exists
         if [ "$DEBUG_MODE" -eq 1 ]; then
             script_name=$(basename "$0" .sh)
             ipset_log="${script_name}_ipset.log"
@@ -1252,12 +1294,18 @@ EOF
     echo "Blocklist applied successfully"
 }
 
-# Main script
-LOCK_FILE="/tmp/blocklist.lock"
-[ ! -w "$(dirname "$LOCK_FILE")" ] && { echo "Error: Cannot write to lock file dir"; exit 1; }
-touch "$LOCK_FILE" 2>/dev/null || { echo "Error: Cannot create $LOCK_FILE"; exit 1; }
-exec 9> "$LOCK_FILE" || { echo "Error: Failed to open lock file"; exit 1; }
-flock -n 9 || { echo "Error: Another instance is running"; exit 1; }
+# Main script (Modified: Added stale lock directory cleanup)
+LOCK_DIR="/tmp/blocklist.lock.d"
+# Clean up stale lock directory if it exists
+if [ -d "$LOCK_DIR" ]; then
+    echo "Warning: Stale lock directory $LOCK_DIR found; attempting to remove it"
+    rmdir "$LOCK_DIR" 2>/dev/null || { echo "Error: Cannot remove stale lock directory $LOCK_DIR; another instance may be running"; exit 1; }
+fi
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "Error: Another instance is running or lock directory creation failed"
+    exit 1
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null; cleanup' EXIT
 
 # Initialize modes
 load_config
@@ -1269,7 +1317,10 @@ DRY_RUN=0
 IPV6_ENABLED=0
 NON_INTERACTIVE=0
 IPSET_TEST=0
+NO_IPV4_MERGE=0
 NO_IPV6_MERGE=0
+[ "$NO_IPV4_MERGE" = "y" ] && NO_IPV4_MERGE=1
+[ "$NO_IPV6_MERGE" = "y" ] && NO_IPV6_MERGE=1
 ACTIONS=()
 
 # Parse options
@@ -1284,6 +1335,7 @@ while [ $# -gt 0 ]; do
         --log) LOG_MODE=1;;
         --dry-run) DRY_RUN=1;;
         --ipv6) IPV6_ENABLED=1;;
+        --no-ipv4-merge) NO_IPV4_MERGE=1;;
         --no-ipv6-merge) NO_IPV6_MERGE=1;;
         --backend) shift; FIREWALL_BACKEND="$1";;
         --non-interactive) NON_INTERACTIVE=1;;
@@ -1292,6 +1344,29 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# Check script syntax in debug mode
+if [ "$DEBUG_MODE" -eq 1 ]; then
+    if ! bash -n "$0" 2>/tmp/blocklist_syntax_errors.$$; then
+        echo "Syntax errors detected in $0:"
+        cat /tmp/blocklist_syntax_errors.$$
+        rm -f /tmp/blocklist_syntax_errors.$$
+        if [ "$NON_INTERACTIVE" -eq 0 ]; then
+            read -p "Continue despite syntax errors? (y/N): " continue_syntax
+            if [[ ! "$continue_syntax" =~ ^[Yy]$ ]]; then
+                echo "Exiting due to syntax errors"
+                exit 1
+            fi
+            echo "Proceeding with potential risks"
+        else
+            echo "Non-interactive mode: Exiting due to syntax errors"
+            exit 1
+        fi
+    else
+        echo "Syntax check passed"
+        rm -f /tmp/blocklist_syntax_errors.$$
+    fi
+fi
 
 # Debug: Confirm debug mode settings
 [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Debug modes - DEBUG_MODE=$DEBUG_MODE, VERBOSE_DEBUG=$VERBOSE_DEBUG" >&2
