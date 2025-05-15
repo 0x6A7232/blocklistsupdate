@@ -41,30 +41,33 @@
 
 # Most current version as of this edit: 4.6.4
 
-# Version 1.1: Added zip/7z support, secure temp files, file locking, dependency checks
+# Version 1.2: Added --dry-run, resource management, IPv6 logging, cron support
 
 # Inspired from https://lowendspirit.com/discussion/7699/use-a-blacklist-of-bad-ips-on-your-linux-firewall-tutorial
 # Credit to user itsdeadjim ( https://lowendspirit.com/profile/itsdeadjim )
 # The original version of the script by itsdeadjim is referred to as 0.5 if it is uploaded
 
+# Configuration paths for storing blocklist configs, credentials, and logs
 CONFIG_DIR="$HOME/.blocklists"
 CRED_FILE="$HOME/.blocklistcredentials.conf"
 LOG_FILE="$HOME/blocklistsupdate.log"
 
-# Use mktemp for secure temporary files
-IP_LIST_RAW=$(mktemp /tmp/iplist_raw.XXXXXX)
-IP_LIST=$(mktemp /tmp/iplist.XXXXXX)
-IPSET_RESTORE_FILE=$(mktemp /tmp/ipset_restore.XXXXXX)
-IPSET_BACKUP_FILE=$(mktemp /tmp/ipset_backup.XXXXXX)
+# Create secure temporary files using mktemp
+IP_LIST_RAW=$(mktemp /tmp/iplist_raw.XXXXXX) || { echo "Error: Failed to create temp file IP_LIST_RAW"; exit 1; }
+IP_LIST=$(mktemp /tmp/iplist.XXXXXX) || { echo "Error: Failed to create temp file IP_LIST"; exit 1; }
+IPSET_RESTORE_FILE=$(mktemp /tmp/ipset_restore.XXXXXX) || { echo "Error: Failed to create temp file IPSET_RESTORE_FILE"; exit 1; }
+IPSET_BACKUP_FILE=$(mktemp /tmp/ipset_backup.XXXXXX) || { echo "Error: Failed to create temp file IPSET_BACKUP_FILE"; exit 1; }
 
 # Ensure temporary files are secure
 chmod 600 "$IP_LIST_RAW" "$IP_LIST" "$IPSET_RESTORE_FILE" "$IPSET_BACKUP_FILE"
 
+# Cleanup function to remove temporary files on exit
 cleanup() {
     rm -f "$IP_LIST_RAW" "$IP_LIST" "$IPSET_RESTORE_FILE" "$IPSET_BACKUP_FILE" /tmp/iplist_*.txt
 }
 trap cleanup EXIT
 
+# Display usage information and available options
 show_help() {
     echo "Usage: $0 [OPTIONS]"
     echo "Options:"
@@ -74,8 +77,10 @@ show_help() {
     echo "  --purge       Remove blocklist rules, ipset, and optionally configs"
     echo "  --debug       Show commands as they are executed for debugging"
     echo "  --log         Save output and errors to ~/blocklistsupdate.log"
+    echo "  --dry-run     Simulate blocklist update without applying changes"
 }
 
+# Check for required dependencies (wget, gunzip, awk, ipset, iptables)
 check_dependencies() {
     for cmd in wget gunzip awk ipset iptables; do
         if ! command -v "$cmd" >/dev/null; then
@@ -90,8 +95,13 @@ check_dependencies() {
     if ! command -v 7z >/dev/null; then
         echo "Warning: '7z' not found; 7z archives cannot be processed."
     fi
+    # Warn about ipset kernel module compatibility
+    if ! modprobe ip_set >/dev/null 2>&1; then
+        echo "Warning: ipset kernel module not available; check if nftables is used instead"
+    fi
 }
 
+# Verify sudo access for iptables and ipset operations
 check_sudo() {
     if ! sudo -n true 2>/dev/null; then
         echo "Error: This script requires sudo access for iptables and ipset operations."
@@ -99,6 +109,7 @@ check_sudo() {
     fi
 }
 
+# Set up configuration directory with secure permissions
 setup_config_dir() {
     if [ ! -d "$CONFIG_DIR" ]; then
         mkdir -p "$CONFIG_DIR"
@@ -108,6 +119,7 @@ setup_config_dir() {
     fi
 }
 
+# Manage credentials stored in CRED_FILE
 manage_credentials() {
     echo "Current credentials ($CRED_FILE):"
     if [ -f "$CRED_FILE" ]; then
@@ -143,11 +155,13 @@ manage_credentials() {
     fi
 }
 
+# Sanitize configuration file names by removing .conf extension
 sanitize_conf_name() {
     local name="$1"
     echo "${name%.conf}"
 }
 
+# Sanitize URLs by extracting and removing credentials
 sanitize_url() {
     local url="$1"
     local stripped_user stripped_pin
@@ -166,6 +180,7 @@ sanitize_url() {
     echo "$clean_url $stripped_user $stripped_pin"
 }
 
+# Manage blocklist configuration files (add, edit, view, delete)
 manage_configs() {
     setup_config_dir
     echo "Current blocklist configs in $CONFIG_DIR:"
@@ -340,6 +355,7 @@ manage_configs() {
     esac
 }
 
+# Remove blocklist rules, ipset, and optionally configs/credentials
 purge_blocklist() {
     check_sudo
     echo "Purging blocklist setup..."
@@ -373,6 +389,7 @@ purge_blocklist() {
     echo "Purge complete."
 }
 
+# Load global credentials from CRED_FILE
 load_credentials() {
     if [ -f "$CRED_FILE" ] && [ -r "$CRED_FILE" ]; then
         USERNAME=$(grep '^USERNAME=' "$CRED_FILE" | cut -d= -f2-)
@@ -380,9 +397,10 @@ load_credentials() {
     fi
 }
 
+# Process a single blocklist config, downloading and parsing IPs
 process_blocklist() {
     local conf_file="$1"
-    local temp_list=$(mktemp /tmp/iplist_$(basename "$conf_file").XXXXXX)
+    local temp_list=$(mktemp /tmp/iplist_$(basename "$conf_file").XXXXXX) || { echo "Error: Failed to create temp file for $conf_file"; return 1; }
     chmod 600 "$temp_list"
 
     # Parse config safely
@@ -493,9 +511,15 @@ process_blocklist() {
     [ -n "$DEBUG_MODE" ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: First 10 lines of $temp_list:" >&2
     [ -n "$DEBUG_MODE" ] && [ "$DEBUG_MODE" -eq 1 ] && head -n 10 "$temp_list" >&2
 
-    # Check for IPv6
+    # Check for IPv6 addresses and offer to log them
     if grep -qE '^[0-9a-fA-F:]+/[0-9]+$' "$temp_list"; then
         echo "Warning: IPv6 addresses detected in $conf_file; this script only supports IPv4."
+        read -p "Log IPv6 addresses to $LOG_FILE.ipv6? (y/N): " log_ipv6
+        if [[ "$log_ipv6" =~ ^[Yy]$ ]]; then
+            echo "Logging IPv6 addresses from $conf_file to $LOG_FILE.ipv6"
+            grep -E '^[0-9a-fA-F:]+/[0-9]+$' "$temp_list" >> "$LOG_FILE.ipv6"
+            chmod 600 "$LOG_FILE.ipv6" 2>/dev/null
+        fi
     fi
 
     local cidr_count=0
@@ -535,7 +559,30 @@ process_blocklist() {
     return 0
 }
 
+# Check system memory and estimate resource needs for blocklist processing
+check_resources() {
+    local total_cidr="$1"
+    # Get available memory in MB
+    free_mem=$(free -m | awk '/Mem:/ {print $4}')
+    # Rough estimate: ~100 bytes per CIDR for sort/uniq, plus ipset overhead (~200 bytes per entry)
+    estimated_mem=$((total_cidr * 300 / 1024 / 1024)) # Convert bytes to MB
+    if [ "$free_mem" -lt $((estimated_mem + 50)) ]; then
+        echo "Warning: Low memory detected (${free_mem}MB free)."
+        echo "Processing $total_cidr CIDRs may require ~${estimated_mem}MB."
+        read -p "Cap ipset hashsize to reduce memory usage? (y/N): " cap_hash
+        if [[ "$cap_hash" =~ ^[Yy]$ ]]; then
+            echo 1048576 # Cap at 1M
+        else
+            echo 0 # No cap
+        fi
+    else
+        echo 0 # No cap needed
+    fi
+}
+
+# Update blocklist by processing configs and applying to ipset/iptables
 update_blocklist() {
+    local dry_run="$1"
     check_sudo
     check_dependencies
     setup_config_dir
@@ -572,6 +619,21 @@ update_blocklist() {
     echo "$dupes"
     echo "------------------------"
 
+    # Check resources and get hashsize cap if needed
+    hashsize_cap=$(check_resources "$total_cidr")
+
+    if [ "$dry_run" -eq 1 ]; then
+        echo "Dry run: Would create ipset with $((total_cidr - dupes)) unique entries"
+        echo "Dry run: Would apply iptables rule: -I INPUT -m set --match-set blacklist src -j DROP"
+        return 0
+    fi
+
+    # Check for multiple iptables rules
+    rule_count=$(sudo iptables -L INPUT -v -n | grep -c "match-set blacklist src")
+    if [ "$rule_count" -gt 1 ]; then
+        echo "Warning: Multiple iptables rules reference blacklist set"
+    fi
+
     sudo iptables -D INPUT -m set --match-set blacklist src -j DROP 2>/dev/null
     sudo ipset save blacklist -file "$IPSET_BACKUP_FILE" 2>/dev/null
     sudo ipset destroy blacklist 2>/dev/null
@@ -580,6 +642,10 @@ update_blocklist() {
     hashsize=$((total_cidr * 2))
     if [ $hashsize -lt 1024 ]; then
         hashsize=1024
+    fi
+    if [ "$hashsize_cap" -gt 0 ] && [ "$hashsize" -gt "$hashsize_cap" ]; then
+        echo "Capping hashsize at $hashsize_cap"
+        hashsize="$hashsize_cap"
     fi
     if ! sudo ipset create blacklist hash:net hashsize "$hashsize"; then
         echo "Failed to create ipset 'blacklist'"
@@ -593,8 +659,22 @@ update_blocklist() {
 
     echo "Applying ipset restore ($((total_cidr - dupes)) unique entries)"
     if ! sudo ipset restore < "$IPSET_RESTORE_FILE"; then
-        echo "Failed to apply ipset restore"
-        exit 1
+        echo "Failed to apply ipset restore; attempting to restore backup"
+        if [ -s "$IPSET_BACKUP_FILE" ] && sudo ipset restore < "$IPSET_BACKUP_FILE"; then
+            echo "Restored previous ipset state"
+            sudo iptables -I INPUT -m set --match-set blacklist src -j DROP 2>/dev/null
+            exit 1
+        else
+            echo "No valid backup available"
+            exit 1
+        fi
+    fi
+
+    # Verify ipset entries
+    restored=$(sudo ipset list blacklist | grep -c '[0-9]\.[0-9]')
+    expected=$(grep -c '^add blacklist' "$IPSET_RESTORE_FILE")
+    if [ "$restored" -ne "$expected" ]; then
+        echo "Warning: Restored $restored entries, expected $expected"
     fi
 
     added=$(sudo ipset list blacklist | grep -c '[0-9]\.[0-9]')
@@ -614,17 +694,24 @@ update_blocklist() {
     echo "Blocklist applied successfully"
 }
 
+# Initialize modes and actions
 DEBUG_MODE=0
 LOG_MODE=0
+DRY_RUN=0
 ACTIONS=()
 
 # File locking to prevent concurrent runs
+if ! touch "/tmp/blocklist.lock" 2>/dev/null; then
+    echo "Error: Cannot create lock file /tmp/blocklist.lock"
+    exit 1
+fi
 exec 9>"/tmp/blocklist.lock"
 if ! flock -n 9; then
     echo "Error: Another instance of the script is running."
     exit 1
 fi
 
+# Parse command-line options
 while [ $# -gt 0 ]; do
     case "$1" in
         --help)
@@ -645,6 +732,9 @@ while [ $# -gt 0 ]; do
         --log)
             LOG_MODE=1
             ;;
+        --dry-run)
+            DRY_RUN=1
+            ;;
         *)
             echo "Unknown option: $1"
             show_help
@@ -654,21 +744,32 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# Enable debug mode if requested
 if [ "$DEBUG_MODE" -eq 1 ]; then
     set -x
 fi
 
+# Enable logging with permission checks
 if [ "$LOG_MODE" -eq 1 ]; then
-    # Overwrite log after backing up
+    touch "$LOG_FILE" 2>/dev/null || { echo "Error: Cannot write to $LOG_FILE"; exit 1; }
+    chmod 600 "$LOG_FILE"
     [ -f "$LOG_FILE" ] && cp -f "$LOG_FILE" "${LOG_FILE}.bak"
     exec > >(tee -a "$LOG_FILE") 2>&1
     echo "Logging to $LOG_FILE"
 fi
 
+# Check sudo in cron context
+if [ -n "$CRON" ]; then
+    echo "Running in cron; ensuring non-interactive mode"
+    sudo -n true || { echo "Cron error: Sudo requires password"; exit 1; }
+fi
+
+# Default to update if no actions specified
 if [ ${#ACTIONS[@]} -eq 0 ]; then
     ACTIONS+=("update")
 fi
 
+# Execute requested actions
 for action in "${ACTIONS[@]}"; do
     case "$action" in
         help)
@@ -685,7 +786,7 @@ for action in "${ACTIONS[@]}"; do
             ;;
         update)
             load_credentials
-            update_blocklist
+            update_blocklist "$DRY_RUN"
             ;;
     esac
 done
