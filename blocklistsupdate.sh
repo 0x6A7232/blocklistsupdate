@@ -42,7 +42,7 @@
 # Most current version as of this edit: 4.6.4
 
 # Supports iptables/nftables, IPv4/IPv6, multiple blocklist sources, and configurable settings
-# Version 4.6.1: Fixed empty ipset issue, permission issues with temp files, improved logging with tee, reduced verbosity in verbosedebug
+# Version 4.6.2: Fixed empty ipset issue, permission issues with temp files, corrected ipset restore, improved debug logging
 
 # Inspired from https://lowendspirit.com/discussion/7699/use-a-blacklist-of-bad-ips-on-your-linux-firewall-tutorial
 # Credit to user itsdeadjim ( https://lowendspirit.com/profile/itsdeadjim )
@@ -206,16 +206,25 @@ setup_temp_files() {
     chmod 660 "$IP_LIST_RAW" "$IP_LIST" "$IPSET_BACKUP_FILE"
 }
 
-# Cleanup temporary files on exit
+# Cleanup temporary files and lock directory on exit
 cleanup() {
     rm -rf "$TEMP_DIR"
     [ "$DEBUG_MODE" -eq 1 ] && echo "Script exited at: $(date)"
+    if [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
+        rm -f "$LOCK_DIR/pid" 2>/dev/null
+        if ! rmdir "$LOCK_DIR" 2>/dev/null; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to remove lock directory $LOCK_DIR; contents:" >&2
+            [ "$DEBUG_MODE" -eq 1 ] && ls -l "$LOCK_DIR" >&2
+            rm -rf "$LOCK_DIR" 2>/dev/null
+        fi
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Removed lock directory $LOCK_DIR" >&2
+    fi
 }
 
 # Display usage information
 show_help() {
     echo "Blocklist management script for Linux firewalls (iptables/nftables, IPv4/IPv6)"
-    echo "Usage: $0 [OPTIONS]"
+    echo "Usage: $0 [--debug-level=1|2] [--log] [--dry-run] [--no-ipv4-merge] [--no-ipv6-merge] [--non-interactive]"
     echo "Options:"
     echo "  --help        Display this help message"
     echo "  --config      Manage blocklist config files (add, edit, delete, view)"
@@ -224,23 +233,23 @@ show_help() {
     echo "  --purge       Remove blocklist rules and ipsets; optionally delete configs"
     echo "  --clear-rules Remove blocklist rules, keeping ipsets for fast reapplication"
     echo "  --apply-rules Re-apply blocklist rules from configs"
+    echo "  --debug-level=1: Enable basic debug output"
+    echo "  --debug-level=2: Enable verbose debug output with script tracing"
     echo "  --debug       Enable debug output (includes syntax check)"
     echo "  --verbosedebug Enables --debug, and adds full tracing"
     echo "  --log         Log output to $LOG_FILE"
-    echo "  --dry-run     Simulate blocklist update without changes"
+    echo "  --dry-run     Simulate blocklist update without making changes"
     echo "  --ipv6        Process IPv6 addresses (default: IPv4 only)"
-    echo "  --no-ipv4-merge  Disable IPv4 CIDR merging (faster, risks overlaps)"
-    echo "  --no-ipv6-merge  Disable IPv6 CIDR merging (faster, risks overlaps)"
+    echo "  --no-ipv4-merge  Skip IPv4 CIDR merging"
+    echo "  --no-ipv6-merge  Skip IPv6 CIDR merging"
     echo "  --backend     Set firewall backend (iptables/nftables, default: $FIREWALL_BACKEND)"
-    echo "  --non-interactive  Suppress prompts, use config defaults"
+    echo "  --non-interactive  Run without user prompts, using config defaults"
     echo "  --ipset-test  Check for duplicates in ipset (adds ~5-10 seconds for 1,500 duplicates)"
     echo "Requirements:"
     echo "  - Required: wget, gunzip, awk, and either (iptables and ipset) or nftables"
     echo "  - Recommended: pv (progress bars), aggregate/aggregate6 (faster merging)"
     echo "Notes:"
     echo "  - Configs stored in $CONFIG_DIR/*.conf"
-    echo "  - Large blocklists (>10,000 CIDRs) may be slow without aggregate"
-    echo "  - Use --no-ipv4-merge/--no-ipv6-merge for speed if overlaps are acceptable"
 }
 
 # Check for required dependencies
@@ -524,7 +533,17 @@ manage_configs() {
 # Purge blocklist setup
 purge_blocklist() {
     check_sudo
-    echo "Removing blocklist rules and ipsets..."
+   if [ "$NON_INTERACTIVE" -eq 0 ]; then
+       echo "(configs and credentials will be preserved unless removed in the next step)" >&2
+       read -p "Confirm, you want to remove blocklist rules and ipsets? (y/N): " confirm_purge </dev/tty
+       if [[ ! "$confirm_purge" =~ ^[Yy]$ ]]; then
+           echo "Purge aborted; no changes made" >&2
+           exit 0
+       fi
+   else
+       echo "Non-interactive mode: Proceeding with purge of blocklist rules and ipsets" >&2
+   fi
+    echo "Removing blocklist rules and ipsets..." >&2
     if [ "$FIREWALL_BACKEND" = "iptables" ]; then
         sudo iptables -D "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>>"$LOG_FILE" || true
         [ "$IPV6_ENABLED" -eq 1 ] && sudo ip6tables -D "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>>"$LOG_FILE" || true
@@ -537,32 +556,32 @@ purge_blocklist() {
         [ "$IPV6_ENABLED" -eq 1 ] && sudo nft delete set ip6 filter "${IPSET_NAME}_v6" 2>>"$LOG_FILE" || true
     fi
     if [ "$NON_INTERACTIVE" -eq 0 ]; then
-        echo "Blocklist rules and ipsets removed; configs and credentials preserved by default."
+       echo "Blocklist rules and ipsets removed; configs and credentials preserved." >&2
         read -p "Also delete configs and credentials in $CONFIG_DIR? (y/N): " delete_configs </dev/tty
         if [[ "$delete_configs" =~ ^[Yy]$ ]]; then
             rm -rf "$CONFIG_DIR" "$CRED_FILE"
-            echo "Configs and credentials deleted"
+            echo "Configs and credentials deleted" >&2
         else
-            echo "Configs and credentials kept"
+            echo "Configs and credentials kept" >&2
         fi
     else
-        echo "Non-interactive mode: Configs and credentials preserved"
+       echo "Non-interactive mode: Configs and credentials preserved" >&2
     fi
-    echo "Blocklist purge complete"
+    echo "Blocklist purge complete" >&2
 }
 
 # Clear blocklist rules from firewall
 clear_rules() {
     check_sudo
     if [ "$NON_INTERACTIVE" -eq 0 ]; then
-        echo "This will remove blocklist firewall rules, keeping ipsets and configs for fast reapplication."
+        echo "This will remove blocklist firewall rules, keeping ipsets and configs for fast reapplication." >&2
         read -p "Continue? (y/N): " confirm_clear </dev/tty
         if [[ ! "$confirm_clear" =~ ^[Yy]$ ]]; then
-            echo "Clearing aborted"
+            echo "Clearing aborted" >&2
             return 0
         fi
     fi
-    echo "Clearing blocklist firewall rules..."
+    echo "Clearing blocklist firewall rules..." >&2
     if [ "$FIREWALL_BACKEND" = "iptables" ]; then
         sudo iptables -D "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>>"$LOG_FILE" || true
         [ "$IPV6_ENABLED" -eq 1 ] && sudo ip6tables -D "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>>"$LOG_FILE" || true
@@ -570,7 +589,7 @@ clear_rules() {
         sudo nft delete rule ip filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip filter "$IPTABLES_CHAIN" | grep "set $IPSET_NAME" | awk '{print $NF}') 2>>"$LOG_FILE" || true
         [ "$IPV6_ENABLED" -eq 1 ] && sudo nft delete rule ip6 filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip6 filter "$IPTABLES_CHAIN" | grep "set ${IPSET_NAME}_v6" | awk '{print $NF}') 2>>"$LOG_FILE" || true
     fi
-    echo "Blocklist firewall rules cleared; ipsets preserved for fast reapplication"
+    echo "Blocklist firewall rules cleared; ipsets preserved for fast reapplication" >&2
 }
 
 # Load credentials
@@ -635,7 +654,7 @@ download_blocklist() {
         fi
         [ "$attempt" -lt "$RETRY_ATTEMPTS" ] && { echo "Retrying in $RETRY_DELAY seconds..."; sleep "$RETRY_DELAY"; }
     done
-    echo "Failed to download $fetch_url after $RETRY_ATTEMPTS attempts"
+    echo "Failed to download $fetch_url after $RETRY_ATTEMPTS attempts" >&2
     rm -f /tmp/wget_output /tmp/pv_output
     return 1
 }
@@ -1140,8 +1159,9 @@ apply_rule() {
 apply_ipset() {
     local family="$1" set_name="$2" ipset_file="$3" expected_count="$4"
     local tmp_script
-    tmp_script=$(mktemp /tmp/ipset_commands.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
-    chmod 600 "$tmp_script"
+    tmp_script="$TEMP_DIR/ipset_commands"
+    touch "$tmp_script" || { echo "Error: Failed to create $tmp_script"; exit 1; }
+    chmod 660 "$tmp_script"
     if [ "$DRY_RUN" -eq 1 ]; then
         echo "Dry run: Would apply $set_name from $ipset_file ($expected_count entries)"
         rm -f "$tmp_script"
@@ -1210,9 +1230,25 @@ apply_ipset() {
                 cat "$tmp_script" >&2
             fi
         fi
+        # Debug: Log tmp_script permissions
+        if [ "$DEBUG_MODE" -eq 1 ]; then
+            echo "DEBUG: Permissions of $tmp_script:" >&2
+            ls -l "$tmp_script" >&2
+        fi
         # Apply ipset commands with chunking
         local ipset_output ipset_status chunk_size=100000 attempts=0 max_attempts=3
-        ipset_output=$(sudo ipset restore < "$tmp_script" 2>&1)
+        split -l 10000 "$tmp_script" "$TEMP_DIR/ipset_chunk_" || { echo "Error: Failed to split $tmp_script into chunks"; rm -f "$tmp_script"; exit 1; }
+        for chunk in "$TEMP_DIR"/ipset_chunk_*; do
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Processing chunk $chunk" >&2
+            ipset_output=$(sudo ipset restore < "$chunk" 2>&1)
+            ipset_status=$?
+            if [ $ipset_status -ne 0 ]; then
+                echo "Error: Failed to apply ipset chunk $chunk: $ipset_output" >&2
+                rm -f "$tmp_script" "$TEMP_DIR"/ipset_chunk_*
+                exit 1
+            fi
+        done
+        rm -f "$TEMP_DIR"/ipset_chunk_*
         ipset_status=$?
         while [ $ipset_status -ne 0 ] && [ $attempts -lt $max_attempts ]; do
             echo "Failed to apply ipset $set_name: $ipset_output" | tee -a "$LOG_FILE"
@@ -1364,14 +1400,15 @@ update_blocklist() {
     fi
     # IPv4 aggregation
     if [ "$NO_IPV4_MERGE" = "y" ]; then
-        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' > "$AGGREGATED_CIDR_LIST"
+        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' > "$TEMP_DIR/aggregated_cidr_list"
     elif command -v aggregate >/dev/null && [ -s "$IP_LIST" ]; then
-        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' | aggregate -q > "$AGGREGATED_CIDR_LIST"
+        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' | aggregate -q > "$TEMP_DIR/aggregated_cidr_list"
     else
-        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' > "$AGGREGATED_CIDR_LIST"
+        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' > "$TEMP_DIR/aggregated_cidr_list"
         merge_cidrs_bash "$AGGREGATED_CIDR_LIST" "$AGGREGATED_CIDR_LIST.tmp"
         mv "$AGGREGATED_CIDR_LIST.tmp" "$AGGREGATED_CIDR_LIST"
     fi
+    mv "$TEMP_DIR/aggregated_cidr_list" "$AGGREGATED_CIDR_LIST"
     # IPv6 aggregation
     if [ "$IPV6_ENABLED" -eq 1 ]; then
         if [ "$NO_IPV6_MERGE" = "y" ]; then
@@ -1426,7 +1463,7 @@ update_blocklist() {
 ORIGINAL_ARGS=("$@")
 ORIGINAL_HOME="$HOME"
 
-# Default variables
+# Initialize variables
 DEBUG_MODE=0
 VERBOSE_DEBUG=0
 LOGGING_ENABLED=0
@@ -1435,7 +1472,7 @@ IPV6_ENABLED=0
 NON_INTERACTIVE=0
 IPSET_TEST=0
 
-# Parse arguments
+# Parse command-line arguments
 while [ $# -gt 0 ]; do
     case "$1" in
         --help)
@@ -1474,8 +1511,26 @@ while [ $# -gt 0 ]; do
             echo "Blocklist rules reapplied"
             exit 0
             ;;
+        --debug-level=*)
+            DEBUG_LEVEL="${1#*=}"
+            if [ "$DEBUG_LEVEL" -eq 1 ]; then
+                DEBUG_MODE=1
+                VERBOSE_DEBUG=0
+                set +x
+            elif [ "$DEBUG_LEVEL" -eq 2 ]; then
+                DEBUG_MODE=1
+                VERBOSE_DEBUG=1
+                set -x
+            else
+                echo "Error: Invalid debug level (1 or 2)"
+                exit 1
+            fi
+            shift
+            ;;
         --debug)
             DEBUG_MODE=1
+            VERBOSE_DEBUG=0
+            set +x
             shift
             ;;
         --verbosedebug)
@@ -1530,6 +1585,35 @@ done
 
 # Set up logging
 load_config
+echo "CONFIG_DIR=$CONFIG_DIR" >&2
+
+# Prevent concurrent runs
+LOCK_DIR="$CONFIG_DIR/blocklist.lock.d"
+echo "LOCK_DIR=$LOCK_DIR" >&2
+if [ -z "$CONFIG_DIR" ] || [ ! -d "$CONFIG_DIR" ] || [ ! -w "$CONFIG_DIR" ]; then
+    echo "Error: CONFIG_DIR ($CONFIG_DIR) is unset, does not exist, or is not writable" >&2
+    exit 1
+fi
+if [ -d "$LOCK_DIR" ]; then
+    echo "Warning: Stale lock directory $LOCK_DIR found; attempting to remove it" >&2
+    rm -f "$LOCK_DIR/pid" 2>/dev/null
+    if rmdir "$LOCK_DIR" 2>/dev/null; then
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Removed stale lock directory $LOCK_DIR" >&2
+    else
+        echo "Error: Cannot remove stale lock directory $LOCK_DIR; contents:" >&2
+        ls -l "$LOCK_DIR" >&2
+        echo "Error: Another instance may be running or directory is non-empty" >&2
+        exit 1
+    fi
+fi
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "Error: Another instance is running or lock directory creation failed" >&2
+    exit 1
+fi
+echo $$ > "$LOCK_DIR/pid"
+[ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Created lock directory $LOCK_DIR with PID $$" >&2
+trap 'cleanup' EXIT INT TERM
+
 if [ "$LOGGING_ENABLED" -eq 1 ]; then
     if ! touch "$LOG_FILE" 2>/dev/null; then
         echo "Error: Cannot write to $LOG_FILE"
@@ -1538,9 +1622,6 @@ if [ "$LOGGING_ENABLED" -eq 1 ]; then
     chmod 600 "$LOG_FILE"
     exec > >(tee -a "$LOG_FILE") 2>&1
 fi
-
-# Trap cleanup on exit
-trap cleanup EXIT
 
 # Run syntax check if in debug mode
 if [ "$DEBUG_MODE" -eq 1 ]; then
