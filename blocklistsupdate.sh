@@ -42,7 +42,7 @@
 # Most current version as of this edit: 4.6.4
 
 # Supports iptables/nftables, IPv4/IPv6, multiple blocklist sources, and configurable settings
-# Version 4.5: Added --clear-rules/--apply-rules for fast enable/disable of script-generated firewall rules, improved ipset reuse, generated help file, added runtime display
+# Version 4.5.1: Added --config-dir option, fixed sudo config path, improved wget handling
 
 # Inspired from https://lowendspirit.com/discussion/7699/use-a-blacklist-of-bad-ips-on-your-linux-firewall-tutorial
 # Credit to user itsdeadjim ( https://lowendspirit.com/profile/itsdeadjim )
@@ -50,11 +50,24 @@
 
 # Load configuration file, generating it if it doesn't exist (Modified: Added NON_INTERACTIVE_SKIP_MERGE)
 load_config() {
-    CONFIG_FILE="$HOME/.blocklist.conf"
+    if [ -n "$CONFIG_DIR_OVERRIDE" ]; then
+        CONFIG_DIR="$CONFIG_DIR_OVERRIDE/.blocklists"
+        CRED_FILE="$CONFIG_DIR_OVERRIDE/.blocklistcredentials.conf"
+        LOG_FILE="$CONFIG_DIR_OVERRIDE/blocklistsupdate.log"
+        HELP_FILE="$CONFIG_DIR_OVERRIDE/blocklist_readme.md"
+        CONFIG_FILE="$CONFIG_DIR_OVERRIDE/.blocklist.conf"
+    else
+        CONFIG_FILE="$HOME/.blocklist.conf"
+    fi
     if [ ! -f "$CONFIG_FILE" ]; then
         # Generate default config with comments
         cat > "$CONFIG_FILE" << 'EOF'
 # Blocklist script configuration file
+# Note: If using --config-dir, paths below are relative to that directory
+# For example, if --config-dir=/home/user, CONFIG_DIR becomes /home/user/.blocklists
+# To use absolute paths, edit these settings after the file is created
+# To use the defaults without --config-dir, leave as-is
+# Paths are relative to $HOME unless --config-dir is specified
 # Edit these settings to customize paths, names, and behaviors
 
 # Directory for blocklist configuration files
@@ -182,7 +195,7 @@ setup_temp_files() {
 
 # Cleanup temporary files on exit
 cleanup() {
-    rm -f "$IP_LIST_RAW" "$IP_LIST" "$IPSET_RESTORE_FILE" "$IPSET_BACKUP_FILE" /tmp/iplist_*.txt /tmp/ipset_commands.* /tmp/cidr_list.* /tmp/aggregated_cidr_list.* /tmp/wget_output /tmp/pv_output
+    rm -f "$IP_LIST_RAW" "$IP_LIST" "$IPSET_RESTORE_FILE" "$IPSET_BACKUP_FILE" /tmp/iplist_*.conf.* /tmp/iplist_raw.* /tmp/iplist.* /tmp/ipset_commands.* /tmp/cidr_list.* /tmp/aggregated_cidr_list.* /tmp/wget_output /tmp/pv_output
     [ "$DEBUG_MODE" -eq 1 ] && echo "Script exited at: $(date)"
 }
 
@@ -194,6 +207,7 @@ show_help() {
     echo "  --help        Display this help message"
     echo "  --config      Manage blocklist config files (add, edit, delete, view)"
     echo "  --auth        Edit or clear credentials"
+    echo "  --config-dir  Override default config directory (~/.blocklists)"
     echo "  --purge       Remove blocklist rules and ipsets; optionally delete configs"
     echo "  --clear-rules Remove blocklist rules, keeping ipsets for fast reapplication"
     echo "  --apply-rules Re-apply blocklist rules from configs"
@@ -259,6 +273,7 @@ check_dependencies() {
 # Verify sudo access, offering re-launch if sudo isn't passwordless
 check_sudo() {
     if [ "$EUID" -eq 0 ]; then
+        [ -z "$CONFIG_DIR_OVERRIDE" ] && CONFIG_DIR_OVERRIDE="$HOME"
         # Already running as root (sudo)
         return 0
     fi
@@ -276,7 +291,7 @@ check_sudo() {
         if [[ "$choice" =~ ^[Rr]$ || -z "$choice" ]]; then
             echo "Re-launching with sudo..."
             # Preserve original arguments
-            exec sudo "$0" "$@"
+            exec sudo "$0" --config-dir="$HOME" "$@"
         else
             echo "Will prompt for sudo password when needed."
             if sudo true; then
@@ -294,6 +309,9 @@ check_sudo() {
 
 # Set up configuration directory
 setup_config_dir() {
+    if [ -n "$CONFIG_DIR_OVERRIDE" ]; then
+        CONFIG_DIR="$CONFIG_DIR_OVERRIDE/.blocklists"
+    fi
     if [ ! -d "$CONFIG_DIR" ]; then
         mkdir -p "$CONFIG_DIR"
         chmod 700 "$CONFIG_DIR"
@@ -584,15 +602,16 @@ download_blocklist() {
     # Attempt download with retries
     for attempt in $(seq 1 "$RETRY_ATTEMPTS"); do
         [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Attempt $attempt: wget $fetch_url" >&2
-        local wget_cmd="wget -nv --location --timeout=10 --tries=1 -O - $fetch_url"
+        local wget_cmd="wget -nv -L --timeout=10 --tries=1 -O $temp_raw $fetch_url"
         if command -v pv >/dev/null; then
             # Use pv to show download progress
-            if $wget_cmd 2>/tmp/wget_output | pv -f -N "Downloading $fetch_url" > "$temp_raw" 2>/tmp/pv_output; then
+            if $wget_cmd 2>/tmp/wget_output && [ -s "$temp_raw" ]; then
+                pv -f -N "Downloading $fetch_url" "$temp_raw" > /dev/null 2>/tmp/pv_output
                 return 0
             fi
         else
             # Fallback to wget without pv
-            if $wget_cmd > "$temp_raw" 2>/tmp/wget_output; then
+            if $wget_cmd 2>/tmp/wget_output && [ -s "$temp_raw" ]; then
                 return 0
             fi
         fi
@@ -1473,6 +1492,8 @@ while [ $# -gt 0 ]; do
         --auth) ACTIONS+=("auth");;
         --purge) ACTIONS+=("purge");;
         --clear-rules) ACTIONS+=("clear_rules");;
+        --config-dir) shift; CONFIG_DIR_OVERRIDE="$1";;
+        --config-dir=*) CONFIG_DIR_OVERRIDE="${1#*=}";;
         --apply-rules) ACTIONS+=("apply_rules");;
         --debug) DEBUG_MODE=1;;
         --verbosedebug) DEBUG_MODE=1; VERBOSE_DEBUG=1;;
