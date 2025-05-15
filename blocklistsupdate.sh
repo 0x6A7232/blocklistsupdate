@@ -42,7 +42,7 @@
 # Most current version as of this edit: 4.6.4
 
 # Supports iptables/nftables, IPv4/IPv6, multiple blocklist sources, and configurable settings
-# Version 4.5.2: Improved sudo argument handling, optimized ipset/nftables population, added error handling for ipset writes
+# Version 4.5.3: Fixed sudo config paths, optimized parse_blocklist scoping, enhanced config validation
 
 # Inspired from https://lowendspirit.com/discussion/7699/use-a-blacklist-of-bad-ips-on-your-linux-firewall-tutorial
 # Credit to user itsdeadjim ( https://lowendspirit.com/profile/itsdeadjim )
@@ -59,7 +59,7 @@ load_config() {
     else
         CONFIG_FILE="$HOME/.blocklist.conf"
     fi
-    if [ ! -f "$CONFIG_FILE" ]; then
+    if [ ! -f "$CONFIG_FILE" ] || [ ! -r "$CONFIG_FILE" ]; then
         # Generate default config with comments
         cat > "$CONFIG_FILE" << 'EOF'
 # Blocklist script configuration file
@@ -71,13 +71,13 @@ load_config() {
 # Edit these settings to customize paths, names, and behaviors
 
 # Directory for blocklist configuration files
-CONFIG_DIR=$HOME/.blocklists
+CONFIG_DIR=$DEFAULT_CONFIG_DIR
 
 # Path to credentials file
-CRED_FILE=$HOME/.blocklistcredentials.conf
+CRED_FILE=$ORIGINAL_HOME/.blocklistcredentials.conf
 
 # Path to log file (used with --log)
-LOG_FILE=$HOME/blocklistsupdate.log
+LOG_FILE=$ORIGINAL_HOME/blocklistsupdate.log
 
 # Name of the ipset or nftables set
 IPSET_NAME=blacklist
@@ -111,7 +111,7 @@ EOF
     fi
     # Source config file
     if [ -r "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
+        source "$CONFIG_FILE" || { echo "Error: Failed to source $CONFIG_FILE"; exit 1; }
     else
         echo "Error: Cannot read $CONFIG_FILE"
         exit 1
@@ -120,7 +120,7 @@ EOF
 
 # Generate blocklist_readme.md if it doesn't exist
 
-HELP_FILE="$HOME/blocklist_readme.md"
+HELP_FILE="$ORIGINAL_HOME/blocklist_readme.md"
 if [ ! -f "$HELP_FILE" ]; then
     # Generate help file
     if ! touch "$HELP_FILE" 2>/dev/null; then
@@ -273,7 +273,8 @@ check_dependencies() {
 # Verify sudo access, offering re-launch if sudo isn't passwordless
 check_sudo() {
     if [ "$EUID" -eq 0 ]; then
-        [ -z "$CONFIG_DIR_OVERRIDE" ] && CONFIG_DIR_OVERRIDE="$HOME"
+    # Allow overriding config directory (e.g., for sudo runs)
+        [ -z "$CONFIG_DIR_OVERRIDE" ] && CONFIG_DIR_OVERRIDE="$ORIGINAL_HOME"
         # Already running as root (sudo)
         return 0
     fi
@@ -646,138 +647,144 @@ parse_blocklist() {
     # Parse each line, handling comments, blanks, and CIDRs
     if command -v pv >/dev/null; then
         # Use pv to show parsing progress
-        while IFS= read -r line || [ -n "$line" ]; do
-            # Check for comments and empty lines before trimming
-            [[ "$line" =~ ^[[:space:]]*$ ]] && {
-                [ "$VERBOSE_DEBUG" -eq 1 ] && echo "DEBUG: Skipping empty line in $conf_file" >&2
-                skipped_empty=$((skipped_empty + 1))
-                continue
-            }
-            [[ "$line" =~ ^[[:space:]]*# ]] && {
-                [ "$VERBOSE_DEBUG" -eq 1 ] && echo "DEBUG: Skipping comment: $line" >&2
-                skipped_comments=$((skipped_comments + 1))
-                continue
-            }
-            # Trim leading/trailing whitespace
-            range=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            # Try name:range format
-            if [[ "$range" =~ ^[^:]+:([0-9a-fA-F.:/]+)$ ]]; then
-                range="${BASH_REMATCH[1]}"
-            fi
-            # Check if IPv4 CIDR (e.g., 192.168.1.0/24)
-            if [[ "$range" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
-                range="${range%/32}" # Normalize single IPs
-                if validate_cidr "$range" inet; then
-                    # Ensure consistent format (always add /32 for single IPs)
-                    if [[ ! "$range" =~ /[0-9]+$ ]]; then
-                        range="$range/32"
-                    fi
-                    batch="$batch\ninet $range"
-                    cidr_count=$((cidr_count + 1))
-                    [ "$DEBUG_MODE" -eq 1 ] && [ $((cidr_count % 10000)) -eq 0 ] && echo "DEBUG: Processed $cidr_count CIDRs in $conf_file" >&2
-                else
-                    echo "Invalid IPv4 CIDR in $conf_file: $range"
+        (
+            [ "$VERBOSE_DEBUG" -eq 1 ] && set +x  # Disable set -x in subshell to avoid logging batch assignments
+            while IFS= read -r line || [ -n "$line" ]; do
+                # Check for comments and empty lines before trimming
+                [[ "$line" =~ ^[[:space:]]*$ ]] && {
+                    [ "$VERBOSE_DEBUG" -eq 1 ] && echo "DEBUG: Skipping empty line in $conf_file" >&2
+                    skipped_empty=$((skipped_empty + 1))
+                    continue
+                }
+                [[ "$line" =~ ^[[:space:]]*# ]] && {
+                    [ "$VERBOSE_DEBUG" -eq 1 ] && echo "DEBUG: Skipping comment: $line" >&2
+                    skipped_comments=$((skipped_comments + 1))
+                    continue
+                }
+                # Trim leading/trailing whitespace
+                range=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                # Try name:range format
+                if [[ "$range" =~ ^[^:]+:([0-9a-fA-F.:/]+)$ ]]; then
+                    range="${BASH_REMATCH[1]}"
                 fi
-            # Check if IPv6 CIDR (e.g., 2001:db8::/64)
-            elif [ "$IPV6_ENABLED" -eq 1 ] && [[ "$range" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]]; then
-                range="${range%/128}" # Normalize single IPs
-                if validate_cidr "$range" inet6; then
-                    # Ensure consistent format (always add /128 for single IPs)
-                    if [[ ! "$range" =~ /[0-9]+$ ]]; then
-                        range="$range/128"
+                # Check if IPv4 CIDR (e.g., 192.168.1.0/24)
+                if [[ "$range" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+                    range="${range%/32}" # Normalize single IPs
+                    if validate_cidr "$range" inet; then
+                        # Ensure consistent format (always add /32 for single IPs)
+                        if [[ ! "$range" =~ /[0-9]+$ ]]; then
+                            range="$range/32"
+                        fi
+                        batch="$batch\ninet $range"
+                        cidr_count=$((cidr_count + 1))
+                        [ "$DEBUG_MODE" -eq 1 ] && [ $((cidr_count % 10000)) -eq 0 ] && echo "DEBUG: Processed $cidr_count CIDRs in $conf_file" >&2
+                    else
+                        echo "Invalid IPv4 CIDR in $conf_file: $range"
                     fi
-                    batch="$batch\ninet6 $range"
-                    cidr_count=$((cidr_count + 1))
-                    [ "$DEBUG_MODE" -eq 1 ] && [ $((cidr_count % 10000)) -eq 0 ] && echo "DEBUG: Processed $cidr_count CIDRs in $conf_file" >&2
-                else
-                    echo "Invalid IPv6 CIDR in $conf_file: $range"
-                fi
-            elif [[ "$range" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]]; then
-                if [ "$NON_INTERACTIVE" -eq 1 ]; then
-                    [ "$NON_INTERACTIVE_LOG_IPV6" = "y" ] && echo "$range" >> "$LOG_FILE.ipv6"
-                else
-                    read -p "IPv6 detected in $conf_file. Log to $LOG_FILE.ipv6? (y/N): " log_ipv6
-                    if [[ "$log_ipv6" =~ ^[Yy]$ ]]; then
-                        echo "$range" >> "$LOG_FILE.ipv6"
-                        chmod 600 "$LOG_FILE.ipv6" 2>/dev/null
+                # Check if IPv6 CIDR (e.g., 2001:db8::/64)
+                elif [ "$IPV6_ENABLED" -eq 1 ] && [[ "$range" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]]; then
+                    range="${range%/128}" # Normalize single IPs
+                    if validate_cidr "$range" inet6; then
+                        # Ensure consistent format (always add /128 for single IPs)
+                        if [[ ! "$range" =~ /[0-9]+$ ]]; then
+                            range="$range/128"
+                        fi
+                        batch="$batch\ninet6 $range"
+                        cidr_count=$((cidr_count + 1))
+                        [ "$DEBUG_MODE" -eq 1 ] && [ $((cidr_count % 10000)) -eq 0 ] && echo "DEBUG: Processed $cidr_count CIDRs in $conf_file" >&2
+                    else
+                        echo "Invalid IPv6 CIDR in $conf_file: $range"
                     fi
+                elif [[ "$range" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]]; then
+                    if [ "$NON_INTERACTIVE" -eq 1 ]; then
+                        [ "$NON_INTERACTIVE_LOG_IPV6" = "y" ] && echo "$range" >> "$LOG_FILE.ipv6"
+                    else
+                        read -p "IPv6 detected in $conf_file. Log to $LOG_FILE.ipv6? (y/N): " log_ipv6
+                        if [[ "$log_ipv6" =~ ^[Yy]$ ]]; then
+                            echo "$range" >> "$LOG_FILE.ipv6"
+                            chmod 600 "$LOG_FILE.ipv6" 2>/dev/null
+                        fi
+                    fi
+                else
+                    echo "Skipping non-CIDR in $conf_file: $range"
+                    fi
+                # Write batch every 1,000 lines to balance memory and I/O
+                if [ $((cidr_count % 1000)) -eq 0 ]; then
+                    echo -e "$batch" | sed '/^$/d' >> "$IP_LIST"  # Remove empty lines from batch
+                    batch=""
                 fi
-            else
-                echo "Skipping non-CIDR in $conf_file: $range"
-            fi
-            # Write batch every 1,000 lines to balance memory and I/O
-            if [ $((cidr_count % 1000)) -eq 0 ]; then
-                echo -e "$batch" | sed '/^$/d' >> "$IP_LIST"  # Remove empty lines from batch
-                batch=""
-            fi
-        done < <(pv -f -N "Parsing $conf_file" -s "$total_lines" "$temp_list")
+            done < <(pv -f -N "Parsing $conf_file" -s "$total_lines" "$temp_list")
+        )
     else
         # Fallback without pv
-        while IFS= read -r line || [ -n "$line" ]; do
-            # Check for comments and empty lines before trimming
-            [[ "$line" =~ ^[[:space:]]*$ ]] && {
-                [ "$VERBOSE_DEBUG" -eq 1 ] && echo "DEBUG: Skipping empty line in $conf_file" >&2
-                skipped_empty=$((skipped_empty + 1))
-                continue
-            }
-            [[ "$line" =~ ^[[:space:]]*# ]] && {
-                [ "$VERBOSE_DEBUG" -eq 1 ] && echo "DEBUG: Skipping comment: $line" >&2
-                skipped_comments=$((skipped_comments + 1))
-                continue
-            }
-            # Trim leading/trailing whitespace
-            range=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            # Try name:range format
-            if [[ "$range" =~ ^[^:]+:([0-9a-fA-F.:/]+)$ ]]; then
-                range="${BASH_REMATCH[1]}"
-            fi
-            # Check if IPv4 CIDR (e.g., 192.168.1.0/24)
-            if [[ "$range" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
-                range="${range%/32}" # Normalize single IPs
-                if validate_cidr "$range" inet; then
-                    # Ensure consistent format (always add /32 for single IPs)
-                    if [[ ! "$range" =~ /[0-9]+$ ]]; then
-                        range="$range/32"
-                    fi
-                    batch="$batch\ninet $range"
-                    cidr_count=$((cidr_count + 1))
-                    [ "$DEBUG_MODE" -eq 1 ] && [ $((cidr_count % 10000)) -eq 0 ] && echo "DEBUG: Processed $cidr_count CIDRs in $conf_file" >&2
-                else
-                    echo "Invalid IPv4 CIDR in $conf_file: $range"
+        (
+            [ "$VERBOSE_DEBUG" -eq 1 ] && set +x  # Disable set -x in subshell to avoid logging batch assignments
+            while IFS= read -r line || [ -n "$line" ]; do
+                # Check for comments and empty lines before trimming
+                [[ "$line" =~ ^[[:space:]]*$ ]] && {
+                    [ "$VERBOSE_DEBUG" -eq 1 ] && echo "DEBUG: Skipping empty line in $conf_file" >&2
+                    skipped_empty=$((skipped_empty + 1))
+                    continue
+                }
+                [[ "$line" =~ ^[[:space:]]*# ]] && {
+                    [ "$VERBOSE_DEBUG" -eq 1 ] && echo "DEBUG: Skipping comment: $line" >&2
+                    skipped_comments=$((skipped_comments + 1))
+                    continue
+                }
+                # Trim leading/trailing whitespace
+                range=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                # Try name:range format
+                if [[ "$range" =~ ^[^:]+:([0-9a-fA-F.:/]+)$ ]]; then
+                    range="${BASH_REMATCH[1]}"
                 fi
-            # Check if IPv6 CIDR (e.g., 2001:db8::/64)
-            elif [ "$IPV6_ENABLED" -eq 1 ] && [[ "$range" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]]; then
-                range="${range%/128}" # Normalize single IPs
-                if validate_cidr "$range" inet6; then
-                    # Ensure consistent format (always add /128 for single IPs)
-                    if [[ ! "$range" =~ /[0-9]+$ ]]; then
-                        range="$range/128"
+                # Check if IPv4 CIDR (e.g., 192.168.1.0/24)
+                if [[ "$range" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+                    range="${range%/32}" # Normalize single IPs
+                    if validate_cidr "$range" inet; then
+                        # Ensure consistent format (always add /32 for single IPs)
+                        if [[ ! "$range" =~ /[0-9]+$ ]]; then
+                            range="$range/32"
+                        fi
+                        batch="$batch\ninet $range"
+                        cidr_count=$((cidr_count + 1))
+                        [ "$DEBUG_MODE" -eq 1 ] && [ $((cidr_count % 10000)) -eq 0 ] && echo "DEBUG: Processed $cidr_count CIDRs in $conf_file" >&2
+                    else
+                        echo "Invalid IPv4 CIDR in $conf_file: $range"
                     fi
-                    batch="$batch\ninet6 $range"
-                    cidr_count=$((cidr_count + 1))
-                    [ "$DEBUG_MODE" -eq 1 ] && [ $((cidr_count % 10000)) -eq 0 ] && echo "DEBUG: Processed $cidr_count CIDRs in $conf_file" >&2
-                else
-                    echo "Invalid IPv6 CIDR in $conf_file: $range"
-                fi
-            elif [[ "$range" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]]; then
-                if [ "$NON_INTERACTIVE" -eq 1 ]; then
-                    [ "$NON_INTERACTIVE_LOG_IPV6" = "y" ] && echo "$range" >> "$LOG_FILE.ipv6"
-                else
-                    read -p "IPv6 detected in $conf_file. Log to $LOG_FILE.ipv6? (y/N): " log_ipv6
-                    if [[ "$log_ipv6" =~ ^[Yy]$ ]]; then
-                        echo "$range" >> "$LOG_FILE.ipv6"
-                        chmod 600 "$LOG_FILE.ipv6" 2>/dev/null
+                # Check if IPv6 CIDR (e.g., 2001:db8::/64)
+                elif [ "$IPV6_ENABLED" -eq 1 ] && [[ "$range" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]]; then
+                    range="${range%/128}" # Normalize single IPs
+                    if validate_cidr "$range" inet6; then
+                        # Ensure consistent format (always add /128 for single IPs)
+                        if [[ ! "$range" =~ /[0-9]+$ ]]; then
+                            range="$range/128"
+                        fi
+                        batch="$batch\ninet6 $range"
+                        cidr_count=$((cidr_count + 1))
+                        [ "$DEBUG_MODE" -eq 1 ] && [ $((cidr_count % 10000)) -eq 0 ] && echo "DEBUG: Processed $cidr_count CIDRs in $conf_file" >&2
+                    else
+                        echo "Invalid IPv6 CIDR in $conf_file: $range"
                     fi
+                elif [[ "$range" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]]; then
+                    if [ "$NON_INTERACTIVE" -eq 1 ]; then
+                        [ "$NON_INTERACTIVE_LOG_IPV6" = "y" ] && echo "$range" >> "$LOG_FILE.ipv6"
+                    else
+                        read -p "IPv6 detected in $conf_file. Log to $LOG_FILE.ipv6? (y/N): " log_ipv6
+                        if [[ "$log_ipv6" =~ ^[Yy]$ ]]; then
+                            echo "$range" >> "$LOG_FILE.ipv6"
+                            chmod 600 "$LOG_FILE.ipv6" 2>/dev/null
+                        fi
+                    fi
+                else
+                    echo "Skipping non-CIDR in $conf_file: $range"
                 fi
-            else
-                echo "Skipping non-CIDR in $conf_file: $range"
-            fi
-            # Write batch every 1,000 lines to balance memory and I/O
-            if [ $((cidr_count % 1000)) -eq 0 ]; then
-                echo -e "$batch" | sed '/^$/d' >> "$IP_LIST"  # Remove empty lines from batch
-                batch=""
-            fi
-        done < "$temp_list"
+                # Write batch every 1,000 lines to balance memory and I/O
+                if [ $((cidr_count % 1000)) -eq 0 ]; then
+                    echo -e "$batch" | sed '/^$/d' >> "$IP_LIST"  # Remove empty lines from batch
+                    batch=""
+                fi
+            done < "$temp_list"
+        )
     fi
     # Write any remaining lines
     [ -n "$batch" ] && echo -e "$batch" | sed '/^$/d' >> "$IP_LIST"
@@ -996,7 +1003,7 @@ merge_cidrs_bash_ipv6() {
 process_blocklist() {
     local conf_file="$1"
     local temp_list
-    temp_list=$(mktemp /tmp/iplist_$(basename "$conf_file").XXXXXX) || { echo "Error: Failed to create temp file"; return 1; }
+    temp_list=$(mktemp /tmp/iplist_$(basename "$conf_file").XXXXXX) || { echo "Error: Failed to create temp file for $conf_file"; return 1; }
     chmod 600 "$temp_list"
 
     # Parse config
@@ -1068,22 +1075,6 @@ process_blocklist() {
     local status=$?
     rm -f "$temp_list"
     return $status
-}
-
-# Create ipset or nftables set
-create_set() {
-    local family="$1" set_name="$2" hashsize="$3"
-    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
-        # Increase maxelem to 1,048,576 and ensure hashsize is sufficient
-        sudo ipset create "$set_name" hash:ip hashsize "$hashsize" family "$family" maxelem 1048576 2>/dev/null
-    else
-        # Create nftables set
-        if [ "$family" = "inet" ]; then
-            sudo nft add set ip filter "$set_name" "{ type ipv4_addr; flags interval; }" 2>/dev/null
-        else
-            sudo nft add set ip6 filter "$set_name" "{ type ipv6_addr; flags interval; }" 2>/dev/null
-        fi
-    fi
 }
 
 # Add CIDRs to set
@@ -1469,6 +1460,16 @@ fi
 trap 'rmdir "$LOCK_DIR" 2>/dev/null; cleanup' EXIT INT TERM
 
 # Initialize modes
+# Determine the original user's home directory
+if [ -n "$SUDO_USER" ]; then
+    # If running under sudo, get the original user's home directory
+    ORIGINAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+else
+    # Otherwise, use the current user's home directory
+    ORIGINAL_HOME="$HOME"
+fi
+DEFAULT_CONFIG_DIR="$ORIGINAL_HOME/.blocklists"
+
 # Preserve original arguments for sudo re-launch
 ORIGINAL_ARGS=("$@")
 
