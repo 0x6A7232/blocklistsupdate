@@ -41,189 +41,278 @@
 
 # Most current version as of this edit: 4.6.4
 
-# Version 1.0: Added multiple blocklist support, config/credential management, --purge option, enhanced CLI
+# Supports iptables/nftables, IPv4/IPv6, multiple blocklist sources, and configurable settings
+# Version 2.0: Added IPv6 support, nftables backend, centralized config, non-interactive mode
 
 # Inspired from https://lowendspirit.com/discussion/7699/use-a-blacklist-of-bad-ips-on-your-linux-firewall-tutorial
 # Credit to user itsdeadjim ( https://lowendspirit.com/profile/itsdeadjim )
 # The original version of the script by itsdeadjim is referred to as 0.5 if it is uploaded
 
-CONFIG_DIR="$HOME/.blocklists"
-CRED_FILE="$HOME/.blocklistcredentials.conf"
-LOG_FILE="$HOME/blocklistsupdate.log"
+# Load configuration file, generating it if it doesn't exist
+load_config() {
+    CONFIG_FILE="$HOME/.blocklist.conf"
+    if [ ! -f "$CONFIG_FILE" ]; then
+        # Generate default config with comments
+        cat > "$CONFIG_FILE" << 'EOF'
+# Blocklist script configuration file
+# Edit these settings to customize paths, names, and behaviors
 
-IP_LIST_RAW="/tmp/iplist.gz"
-IP_LIST="/tmp/iplist.txt"
-IPSET_RESTORE_FILE="/tmp/ipset_restore.txt"
+# Directory for blocklist configuration files
+CONFIG_DIR=$HOME/.blocklists
 
-trap 'rm -f "$IP_LIST_RAW" "$IP_LIST" "$IPSET_RESTORE_FILE"' EXIT
+# Path to credentials file
+CRED_FILE=$HOME/.blocklistcredentials.conf
 
+# Path to log file (used with --log)
+LOG_FILE=$HOME/blocklistsupdate.log
+
+# Name of the ipset or nftables set
+IPSET_NAME=blacklist
+
+# iptables chain to apply rules (e.g., INPUT, FORWARD)
+IPTABLES_CHAIN=INPUT
+
+# Firewall backend: iptables or nftables
+FIREWALL_BACKEND=iptables
+
+# Number of retry attempts for downloading blocklists
+RETRY_ATTEMPTS=3
+
+# Delay between retry attempts in seconds
+RETRY_DELAY=5
+
+# Non-interactive mode defaults (used with --non-interactive)
+# Set to 'y' or 'n' to control behavior without prompts
+NON_INTERACTIVE_EDIT_CREDENTIALS=n
+NON_INTERACTIVE_LOG_IPV6=n
+NON_INTERACTIVE_CAP_HASHSIZE=n
+NON_INTERACTIVE_CONTINUE_IPTABLES=y
+NON_INTERACTIVE_CONTINUE_NO_BACKUP=n
+EOF
+        chmod 600 "$CONFIG_FILE"
+    fi
+    # Source config file
+    if [ -r "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    else
+        echo "Error: Cannot read $CONFIG_FILE"
+        exit 1
+    fi
+}
+
+# Create secure temporary files
+setup_temp_files() {
+    IP_LIST_RAW=$(mktemp /tmp/iplist_raw.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
+    IP_LIST=$(mktemp /tmp/iplist.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
+    IPSET_RESTORE_FILE=$(mktemp /tmp/ipset_restore.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
+    IPSET_BACKUP_FILE=$(mktemp /tmp/ipset_backup.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
+    chmod 600 "$IP_LIST_RAW" "$IP_LIST" "$IPSET_RESTORE_FILE" "$IPSET_BACKUP_FILE"
+}
+
+# Cleanup temporary files on exit
+cleanup() {
+    rm -f "$IP_LIST_RAW" "$IP_LIST" "$IPSET_RESTORE_FILE" "$IPSET_BACKUP_FILE" /tmp/iplist_*.txt
+}
+trap cleanup EXIT
+
+# Display usage information
 show_help() {
     echo "Usage: $0 [OPTIONS]"
     echo "Options:"
     echo "  --help        Display this help message"
     echo "  --config      Manage blocklist config files (add, edit, delete, view)"
-    echo "  --auth        Edit or clear credentials in ~/.blocklistcredentials.conf"
+    echo "  --auth        Edit or clear credentials"
     echo "  --purge       Remove blocklist rules, ipset, and optionally configs"
-    echo "  --debug       Show commands as they are executed for debugging"
-    echo "  --log         Save output and errors to ~/blocklistsupdate.log"
+    echo "  --debug       Enable high-level debug output"
+    echo "  --verbosedebug Enable detailed debug output (full tracing)"
+    echo "  --log         Log output to $LOG_FILE"
+    echo "  --dry-run     Simulate blocklist update without changes"
+    echo "  --ipv6        Process IPv6 addresses (default: IPv4 only)"
+    echo "  --backend     Set firewall backend (iptables/nftables, default: $FIREWALL_BACKEND)"
+    echo "  --non-interactive  Suppress prompts, use config defaults"
 }
 
+# Check for required dependencies
+check_dependencies() {
+    local cmds="wget gunzip awk"
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        cmds="$cmds iptables ipset"
+    elif [ "$FIREWALL_BACKEND" = "nftables" ]; then
+        cmds="$cmds nft"
+    fi
+    for cmd in $cmds; do
+        if ! command -v "$cmd" >/dev/null; then
+            echo "Error: Required command '$cmd' not found"
+            exit 1
+        fi
+    done
+    # Optional tools
+    for cmd in unzip 7z; do
+        if ! command -v "$cmd" >/dev/null; then
+            echo "Warning: '$cmd' not found; some archive formats unsupported"
+        fi
+    done
+    # Kernel module check for ipset
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        if ! modprobe ip_set >/dev/null 2>&1; then
+            echo "Warning: ipset kernel module not available"
+        fi
+    fi
+}
+
+# Verify sudo access
+check_sudo() {
+    if sudo -n true 2>/dev/null; then
+        return 0
+    fi
+    # Allow password prompt for interactive runs
+    if [ "$NON_INTERACTIVE" -eq 0 ] && [ -z "$CRON" ]; then
+        echo "This script requires sudo access. You may be prompted for your password."
+        if sudo true; then
+            return 0
+        fi
+    fi
+    echo "Error: Sudo access required (non-interactive mode requires passwordless sudo)"
+    exit 1
+}
+
+# Set up configuration directory
 setup_config_dir() {
     if [ ! -d "$CONFIG_DIR" ]; then
         mkdir -p "$CONFIG_DIR"
         chmod 700 "$CONFIG_DIR"
     elif [ ! -w "$CONFIG_DIR" ]; then
-        echo "Warning: $CONFIG_DIR is not writable; may need sudo to fix permissions."
+        echo "Warning: $CONFIG_DIR is not writable"
     fi
 }
 
+# Manage credentials
 manage_credentials() {
-    echo "Current credentials ($CRED_FILE):"
-    if [ -f "$CRED_FILE" ]; then
-        if [ -r "$CRED_FILE" ]; then
-            cat "$CRED_FILE"
-        else
-            echo "(Cannot read credentials: permission denied)"
+    if [ "$NON_INTERACTIVE" -eq 1 ]; then
+        if [ "$NON_INTERACTIVE_EDIT_CREDENTIALS" != "y" ]; then
+            echo "Skipping credential edit in non-interactive mode"
+            return
         fi
+    fi
+    echo "Current credentials ($CRED_FILE):"
+    if [ -f "$CRED_FILE" ] && [ -r "$CRED_FILE" ]; then
+        cat "$CRED_FILE"
     else
-        echo "(No credentials file found)"
+        echo "(None)"
     fi
     echo
+    if [ "$NON_INTERACTIVE" -eq 1 ]; then
+        return
+    fi
     read -p "Edit credentials? (y/N): " edit
     if [[ "$edit" =~ ^[Yy]$ ]]; then
-        read -p "Enter username (leave blank for none): " username
-        read -p "Enter PIN (leave blank for none): " pin
+        read -p "Enter username (blank for none): " username
+        read -p "Enter PIN (blank for none): " pin
         if [ -z "$username" ] && [ -z "$pin" ]; then
             if [ -f "$CRED_FILE" ]; then
-                if [ -w "$CRED_FILE" ]; then
-                    rm "$CRED_FILE"
-                else
-                    echo "Need sudo to remove $CRED_FILE (owned by root)."
-                    sudo rm "$CRED_FILE"
-                fi
-                echo "Credentials cleared."
+                [ -w "$CRED_FILE" ] && rm "$CRED_FILE" || sudo rm "$CRED_FILE"
+                echo "Credentials cleared"
             fi
         else
             echo "USERNAME=$username" > "$CRED_FILE"
             echo "PIN=$pin" >> "$CRED_FILE"
             chmod 600 "$CRED_FILE"
-            echo "Credentials updated."
+            echo "Credentials updated"
         fi
     fi
 }
 
+# Sanitize config name
 sanitize_conf_name() {
-    local name="$1"
-    echo "${name%.conf}"
+    echo "${1%.conf}"
 }
 
+# Sanitize URL, extracting credentials
 sanitize_url() {
     local url="$1"
     local stripped_user stripped_pin
     stripped_user=$(echo "$url" | sed -n 's/.*[?&]username=\([^&]*\).*/\1/p')
     stripped_pin=$(echo "$url" | sed -n 's/.*[?&]pin=\([^&]*\).*/\1/p')
-    [ -n "$DEBUG_MODE" ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Extracted username=[$stripped_user], pin=[$stripped_pin]" >&2
+    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Extracted username=[$stripped_user], pin=[$stripped_pin]" >&2
     local clean_url
     clean_url=$(echo "$url" | sed 's/[?&]username=[^&]*//g;s/[?&]pin=[^&]*//g;s/&&/\&/g;s/?&/?/g;s/&$//;s/?$//')
-    echo "$clean_url $stripped_user $stripped_pin"
+    if ! echo "$clean_url" | grep -q "fileformat="; then
+        clean_url="${clean_url}&fileformat=cidr"
+    fi
+    if ! echo "$clean_url" | grep -q "archiveformat="; then
+        clean_url="${clean_url}&archiveformat=gz"
+    fi
+    printf "%s|%s|%s\n" "$clean_url" "$stripped_user" "$stripped_pin"
 }
 
+# Manage blocklist configs
 manage_configs() {
     setup_config_dir
-    echo "Current blocklist configs in $CONFIG_DIR:"
+    echo "Current configs in $CONFIG_DIR:"
     ls -1 "$CONFIG_DIR" | grep '\.conf$' | sed 's/\.conf$//' || echo "(None)"
     echo
     echo "Options: (a)dd, (e)dit, (v)iew, (d)elete one, (D)elete all, (q)uit"
     read -p "Choose action: " action
     case "$action" in
         a|A)
-            read -p "Enter config name (e.g., iblocklist): " name
+            read -p "Enter config name: " name
             name=$(sanitize_conf_name "$name")
-            if [ -z "$name" ]; then
-                echo "Name required."
-                exit 1
-            fi
+            [ -z "$name" ] && { echo "Name required"; exit 1; }
             read -p "Enter blocklist URL: " url
-            if [ -z "$url" ]; then
-                echo "URL required."
-                exit 1
-            fi
-            local stripped_user stripped_pin clean_url
-            read clean_url stripped_user stripped_pin <<< $(sanitize_url "$url")
+            [ -z "$url" ] && { echo "URL required"; exit 1; }
+            local clean_url stripped_user stripped_pin
+            read clean_url stripped_user stripped_pin < <(sanitize_url "$url" | tr '|' ' ')
+            local list_user list_pin
             if [ -n "$stripped_user" ] || [ -n "$stripped_pin" ]; then
                 echo "Found credentials in URL:"
                 echo "Username: $stripped_user"
                 echo "PIN: $stripped_pin"
-                read -p "Add these to config automatically? (y/N): " auto_add
+                read -p "Add to config? (y/N): " auto_add
                 if [[ "$auto_add" =~ ^[Yy]$ ]]; then
                     list_user="$stripped_user"
                     list_pin="$stripped_pin"
-                else
-                    echo "Credentials discarded. You can add them manually."
                 fi
             fi
-            if [ -z "$list_user" ]; then
-                read -p "Enter username for this list (leave blank to use $CRED_FILE): " list_user
-            fi
-            if [ -z "$list_pin" ]; then
-                read -p "Enter PIN for this list (leave blank to use $CRED_FILE): " list_pin
-            fi
+            [ -z "$list_user" ] && read -p "Enter username (blank for $CRED_FILE): " list_user
+            [ -z "$list_pin" ] && read -p "Enter PIN (blank for $CRED_FILE): " list_pin
             conf_file="$CONFIG_DIR/$name.conf"
             echo "URL=$clean_url" > "$conf_file"
-            if [ -n "$list_user" ]; then
-                echo "USERNAME=$list_user" >> "$conf_file"
-            fi
-            if [ -n "$list_pin" ]; then
-                echo "PIN=$list_pin" >> "$conf_file"
-            fi
+            [ -n "$list_user" ] && echo "USERNAME=$list_user" >> "$conf_file"
+            [ -n "$list_pin" ] && echo "PIN=$list_pin" >> "$conf_file"
             chmod 600 "$conf_file"
             echo "Added $conf_file"
             ;;
         e|E)
-            read -p "Enter config name to edit: " name
+            read -p "Enter config name: " name
             name=$(sanitize_conf_name "$name")
             conf_file="$CONFIG_DIR/$name.conf"
-            if [ ! -f "$conf_file" ]; then
-                echo "Config $name.conf not found."
-                exit 1
-            fi
+            [ ! -f "$conf_file" ] && { echo "Config not found"; exit 1; }
             echo "Current config ($conf_file):"
-            if [ -r "$conf_file" ]; then
-                cat "$conf_file"
-            else
-                echo "(Cannot read config: permission denied)"
-            fi
-            echo
-            read -p "Enter new URL (leave blank to keep current): " url
-            local stripped_user stripped_pin clean_url
+            [ -r "$conf_file" ] && cat "$conf_file" || echo "(Permission denied)"
+            read -p "Enter new URL (blank to keep): " url
+            local clean_url stripped_user stripped_pin
             if [ -n "$url" ]; then
-                read clean_url stripped_user stripped_pin <<< $(sanitize_url "$url")
+                read clean_url stripped_user stripped_pin < <(sanitize_url "$url" | tr '|' ' ')
                 if [ -n "$stripped_user" ] || [ -n "$stripped_pin" ]; then
                     echo "Found credentials in URL:"
                     echo "Username: $stripped_user"
                     echo "PIN: $stripped_pin"
-                    read -p "Add these to config automatically? (y/N): " auto_add
+                    read -p "Add to config? (y/N): " auto_add
                     if [[ "$auto_add" =~ ^[Yy]$ ]]; then
                         list_user="$stripped_user"
                         list_pin="$stripped_pin"
-                    else
-                        echo "Credentials discarded. You can add them manually."
                     fi
                 fi
             fi
-            if [ -z "$list_user" ]; then
-                read -p "Enter new username (leave blank to keep/use $CRED_FILE): " list_user
-            fi
-            if [ -z "$list_pin" ]; then
-                read -p "Enter new PIN (leave blank to keep/use $CRED_FILE): " list_pin
-            fi
+            [ -z "$list_user" ] && read -p "Enter new username (blank to keep): " list_user
+            [ -z "$list_pin" ] && read -p "Enter new PIN (blank to keep): " list_pin
             if [ -n "$url" ]; then
                 echo "URL=$clean_url" > "$conf_file.tmp"
             else
                 grep '^URL=' "$conf_file" > "$conf_file.tmp"
             fi
             if [ -n "$list_user" ]; then
-                echo "USERNAME=$list_user" > "$conf_file.tmp"
+                echo "USERNAME=$list_user" >> "$conf_file.tmp"
             elif grep '^USERNAME=' "$conf_file"; then
                 grep '^USERNAME=' "$conf_file" >> "$conf_file.tmp"
             fi
@@ -237,144 +326,231 @@ manage_configs() {
             echo "Updated $conf_file"
             ;;
         v|V)
-            read -p "Enter config name to view: " name
+            read -p "Enter config name: " name
             name=$(sanitize_conf_name "$name")
             conf_file="$CONFIG_DIR/$name.conf"
-            if [ ! -f "$conf_file" ]; then
-                echo "Config $name.conf not found."
-                exit 1
-            fi
+            [ ! -f "$conf_file" ] && { echo "Config not found"; exit 1; }
             echo "Config ($conf_file):"
-            if [ -r "$conf_file" ]; then
-                cat "$conf_file"
-            else
-                echo "(Cannot read config: permission denied)"
-            fi
+            [ -r "$conf_file" ] && cat "$conf_file" || echo "(Permission denied)"
             ;;
         D)
             read -p "Delete ALL configs? (y/N): " confirm
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
                 configs_found=0
-                echo "Deleting configs:"
                 for conf_file in "$CONFIG_DIR"/*.conf; do
                     if [ -f "$conf_file" ]; then
                         configs_found=1
                         conf_name=$(basename "$conf_file" .conf)
                         echo "- $conf_name"
-                        if [ -w "$conf_file" ]; then
-                            rm "$conf_file"
-                        else
-                            echo "Need sudo to delete $conf_file (owned by root)."
-                            sudo rm "$conf_file"
-                        fi
+                        [ -w "$conf_file" ] && rm "$conf_file" || sudo rm "$conf_file"
                     fi
                 done
-                if [ "$configs_found" -eq 0 ]; then
-                    echo "(No configs found)"
-                else
-                    echo "All configs deleted."
-                fi
+                [ "$configs_found" -eq 0 ] && echo "(No configs found)" || echo "All configs deleted"
             fi
             ;;
         d)
-            read -p "Enter config name to delete: " name
+            read -p "Enter config name: " name
             name=$(sanitize_conf_name "$name")
             conf_file="$CONFIG_DIR/$name.conf"
-            if [ ! -f "$conf_file" ]; then
-                echo "Config $name.conf not found."
-                exit 1
-            fi
-            if [ -w "$conf_file" ]; then
-                rm "$conf_file"
-            else
-                echo "Need sudo to delete $conf_file (owned by root)."
-                sudo rm "$conf_file"
-            fi
+            [ ! -f "$conf_file" ] && { echo "Config not found"; exit 1; }
+            [ -w "$conf_file" ] && rm "$conf_file" || sudo rm "$conf_file"
             echo "Deleted $conf_file"
             ;;
         q|Q)
             exit 0
             ;;
         *)
-            echo "Invalid action."
+            echo "Invalid action"
             exit 1
             ;;
     esac
 }
 
+# Purge blocklist setup
 purge_blocklist() {
+    check_sudo
     echo "Purging blocklist setup..."
-    echo "Need sudo to remove iptables rule and ipset."
-    sudo iptables -D INPUT -m set --match-set blacklist src -j DROP 2>/dev/null
-    sudo ipset destroy blacklist 2>/dev/null
-    echo "iptables rule and ipset removed."
-    read -p "Also delete all configs and credentials? (y/N): " delete_all
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        sudo iptables -D "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null
+        [ "$IPV6_ENABLED" -eq 1 ] && sudo ip6tables -D "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>/dev/null
+        sudo ipset destroy "$IPSET_NAME" 2>/dev/null
+        [ "$IPV6_ENABLED" -eq 1 ] && sudo ipset destroy "${IPSET_NAME}_v6" 2>/dev/null
+    else
+        sudo nft delete rule ip filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip filter "$IPTABLES_CHAIN" | grep "set $IPSET_NAME" | awk '{print $NF}') 2>/dev/null
+        [ "$IPV6_ENABLED" -eq 1 ] && sudo nft delete rule ip6 filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip6 filter "$IPTABLES_CHAIN" | grep "set ${IPSET_NAME}_v6" | awk '{print $NF}') 2>/dev/null
+        sudo nft delete set ip filter "$IPSET_NAME" 2>/dev/null
+        [ "$IPV6_ENABLED" -eq 1 ] && sudo nft delete set ip6 filter "${IPSET_NAME}_v6" 2>/dev/null
+    fi
+    echo "Rules and sets removed"
+    read -p "Delete configs and credentials? (y/N): " delete_all
     if [[ "$delete_all" =~ ^[Yy]$ ]]; then
-        echo "Need sudo to remove $CRED_FILE if owned by root."
-        if [ -f "$CRED_FILE" ]; then
-            if [ -w "$CRED_FILE" ]; then
-                rm "$CRED_FILE"
-            else
-                sudo rm "$CRED_FILE"
-            fi
-            echo "Credentials deleted."
-        fi
+        [ -f "$CRED_FILE" ] && { [ -w "$CRED_FILE" ] && rm "$CRED_FILE" || sudo rm "$CRED_FILE"; echo "Credentials deleted"; }
         if [ -d "$CONFIG_DIR" ]; then
             for conf_file in "$CONFIG_DIR"/*.conf; do
-                if [ -f "$conf_file" ]; then
-                    if [ -w "$conf_file" ]; then
-                        rm "$conf_file"
-                    else
-                        echo "Need sudo to delete $conf_file (owned by root)."
-                        sudo rm "$conf_file"
-                    fi
-                fi
+                [ -f "$conf_file" ] && { [ -w "$conf_file" ] && rm "$conf_file" || sudo rm "$conf_file"; }
             done
             rmdir "$CONFIG_DIR"
-            echo "All configs deleted."
+            echo "Configs deleted"
         fi
     fi
-    echo "Purge complete."
+    echo "Purge complete"
 }
 
+# Load credentials
 load_credentials() {
     if [ -f "$CRED_FILE" ] && [ -r "$CRED_FILE" ]; then
-        source "$CRED_FILE"
+        USERNAME=$(grep '^USERNAME=' "$CRED_FILE" | cut -d= -f2-)
+        PIN=$(grep '^PIN=' "$CRED_FILE" | cut -d= -f2-)
     fi
 }
 
+# Validate CIDR format
+validate_cidr() {
+    local range="$1" family="$2"
+    if [ "$family" = "inet" ]; then
+        # Validate IPv4 CIDR
+        if [[ "$range" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+            local ip mask
+            IFS='/' read -r ip mask <<< "$range"
+            [ -z "$mask" ] && mask=32
+            IFS='.' read -r a b c d <<< "$ip"
+            for octet in $a $b $c $d; do
+                [ "$octet" -gt 255 ] || [ "$octet" -lt 0 ] && return 1
+            done
+            [ "$mask" -ge 1 ] && [ "$mask" -le 32 ] && return 0
+        fi
+    elif [ "$family" = "inet6" ]; then
+        # Validate IPv6 CIDR (basic check for hex and mask)
+        if [[ "$range" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]]; then
+            local ip mask
+            IFS='/' read -r ip mask <<< "$range"
+            [ -z "$mask" ] && mask=128
+            [ "$mask" -ge 1 ] && [ "$mask" -le 128 ] && return 0
+        fi
+    fi
+    return 1
+}
+
+# Download blocklist with retry logic
+download_blocklist() {
+    local fetch_url="$1" temp_raw="$2"
+    # Attempt download with retries
+    for attempt in $(seq 1 "$RETRY_ATTEMPTS"); do
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Attempt $attempt: wget $fetch_url" >&2
+        if wget -nv --timeout=10 --tries=1 -O "$temp_raw" "$fetch_url" 2>&1 | tee /tmp/wget_output; then
+            return 0
+        fi
+        local wget_error=$(cat /tmp/wget_output)
+        if echo "$wget_error" | grep -q "403 Forbidden"; then
+            echo "Authentication failed for $fetch_url"
+            rm -f /tmp/wget_output
+            return 1
+        elif echo "$wget_error" | grep -q "429 Too Many Requests"; then
+            echo "Rate limit exceeded for $fetch_url"
+        else
+            echo "Download attempt $attempt failed: $wget_error"
+        fi
+        [ "$attempt" -lt "$RETRY_ATTEMPTS" ] && { echo "Retrying in $RETRY_DELAY seconds..."; sleep "$RETRY_DELAY"; }
+    done
+    echo "Failed to download $fetch_url after $RETRY_ATTEMPTS attempts"
+    rm -f /tmp/wget_output
+    return 1
+}
+
+# Parse blocklist file
+parse_blocklist() {
+    local conf_file="$1" temp_list="$2"
+    local cidr_count=0 skipped_count=0
+    # Debug: Show first 5 lines to inspect file format
+    [ "$DEBUG_MODE" -eq 1 ] && {
+        echo "DEBUG: First 5 lines of $temp_list:" >&2
+        head -n 5 "$temp_list" >&2
+    }
+    # Parse each line, handling comments, blanks, and CIDRs
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Check for comments and empty lines before trimming
+        [[ "$line" =~ ^[[:space:]]*$ ]] && {
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping empty line in $conf_file" >&2
+            skipped_count=$((skipped_count + 1))
+            continue
+        }
+        [[ "$line" =~ ^[[:space:]]*# ]] && {
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping comment: $line" >&2
+            skipped_count=$((skipped_count + 1))
+            continue
+        }
+        # Trim leading/trailing whitespace
+        range=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        # Try name:range format
+        if [[ "$range" =~ ^[^:]+:([0-9a-fA-F.:/]+)$ ]]; then
+            range="${BASH_REMATCH[1]}"
+        fi
+        # Check if IPv4 CIDR (e.g., 192.168.1.0/24)
+        if [[ "$range" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+            range="${range%/32}" # Normalize single IPs
+            if validate_cidr "$range" inet; then
+                echo "inet $range" >> "$IP_LIST"
+                cidr_count=$((cidr_count + 1))
+                [ "$DEBUG_MODE" -eq 1 ] && [ $((cidr_count % 10000)) -eq 0 ] && echo "DEBUG: Processed $cidr_count CIDRs in $conf_file" >&2
+            else
+                echo "Invalid IPv4 CIDR in $conf_file: $range"
+            fi
+        # Check if IPv6 CIDR (e.g., 2001:db8::/64)
+        elif [ "$IPV6_ENABLED" -eq 1 ] && [[ "$range" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]]; then
+            range="${range%/128}" # Normalize single IPs
+            if validate_cidr "$range" inet6; then
+                echo "inet6 $range" >> "$IP_LIST"
+                cidr_count=$((cidr_count + 1))
+                [ "$DEBUG_MODE" -eq 1 ] && [ $((cidr_count % 10000)) -eq 0 ] && echo "DEBUG: Processed $cidr_count CIDRs in $conf_file" >&2
+            else
+                echo "Invalid IPv6 CIDR in $conf_file: $range"
+            fi
+        elif [[ "$range" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]]; then
+            if [ "$NON_INTERACTIVE" -eq 1 ]; then
+                [ "$NON_INTERACTIVE_LOG_IPV6" = "y" ] && echo "$range" >> "$LOG_FILE.ipv6"
+            else
+                read -p "IPv6 detected in $conf_file. Log to $LOG_FILE.ipv6? (y/N): " log_ipv6
+                if [[ "$log_ipv6" =~ ^[Yy]$ ]]; then
+                    echo "$range" >> "$LOG_FILE.ipv6"
+                    chmod 600 "$LOG_FILE.ipv6" 2>/dev/null
+                fi
+            fi
+        else
+            echo "Skipping non-CIDR in $conf_file: $range"
+        fi
+    done < "$temp_list"
+    [ "$DEBUG_MODE" -eq 1 ] && {
+        echo "DEBUG: Found $cidr_count CIDRs, skipped $skipped_count lines in $temp_list" >&2
+    }
+    echo "Added $cidr_count CIDRs from $conf_file"
+    if [ "$cidr_count" -eq 0 ]; then
+        echo "Warning: No valid CIDRs found in $conf_file"
+    fi
+    return 0
+}
+
+# Process a single blocklist
 process_blocklist() {
     local conf_file="$1"
-    local temp_list="/tmp/iplist_$(basename "$conf_file").txt"
+    local temp_list=$(mktemp /tmp/iplist_$(basename "$conf_file").XXXXXX) || { echo "Error: Failed to create temp file"; return 1; }
+    chmod 600 "$temp_list"
 
-    unset URL USERNAME PIN
-    if [ -r "$conf_file" ]; then
-        source <(grep '^URL=\|^USERNAME=\|^PIN=' "$conf_file")
-    else
-        echo "Cannot read $conf_file: permission denied"
-        return 1
-    fi
-    if [ -z "$URL" ]; then
-        echo "Skipping $conf_file: Invalid or empty URL"
-        return 1
-    fi
-    local stripped_user stripped_pin clean_url
-    read clean_url stripped_user stripped_pin <<< $(sanitize_url "$URL")
+    # Parse config
+    local URL USERNAME PIN
+    URL=$(grep '^URL=' "$conf_file" | cut -d= -f2-)
+    USERNAME=$(grep '^USERNAME=' "$conf_file" | cut -d= -f2-)
+    PIN=$(grep '^PIN=' "$conf_file" | cut -d= -f2-)
+    [ -z "$URL" ] && { echo "Skipping $conf_file: No URL"; rm "$temp_list"; return 1; }
+    local clean_url stripped_user stripped_pin
+    read clean_url stripped_user stripped_pin < <(sanitize_url "$URL" | tr '|' ' ')
     if [ -n "$stripped_user" ] || [ -n "$stripped_pin" ]; then
-        echo "Warning: Credentials found in $conf_file URL:"
-        echo "Username: $stripped_user"
-        echo "PIN: $stripped_pin"
-        echo "These will be ignored; using USERNAME/PIN from config."
+        echo "Warning: Credentials in $conf_file URL ignored"
     fi
     URL="$clean_url"
-    if [ -z "$URL" ]; then
-        echo "Skipping $conf_file: Invalid URL after sanitization"
-        return 1
-    fi
     if [ -z "$USERNAME" ] && [ -f "$CRED_FILE" ] && [ -r "$CRED_FILE" ]; then
-        source "$CRED_FILE"
+        USERNAME=$(grep '^USERNAME=' "$CRED_FILE" | cut -d= -f2-)
+        PIN=$(grep '^PIN=' "$CRED_FILE" | cut -d= -f2-)
     fi
-
     local fetch_url="$URL"
     if [ -n "$USERNAME" ] && [ -n "$PIN" ]; then
         if [[ "$fetch_url" =~ \? ]]; then
@@ -384,200 +560,331 @@ process_blocklist() {
         fi
     fi
 
-    [ -n "$DEBUG_MODE" ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Fetching URL: $fetch_url" >&2
-    if ! wget -nv --timeout=10 --tries=2 -O "$IP_LIST_RAW" "$fetch_url"; then
-        echo "Failed to download $fetch_url (skipping)"
+    # Download
+    if ! download_blocklist "$fetch_url" "$IP_LIST_RAW"; then
+        rm "$temp_list"
         return 1
     fi
-    if [ ! -s "$IP_LIST_RAW" ]; then
-        echo "Downloaded file is empty ($fetch_url)"
-        return 1
-    fi
-    [ -n "$DEBUG_MODE" ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Downloaded size: $(stat -c %s "$IP_LIST_RAW") bytes" >&2
+    [ ! -s "$IP_LIST_RAW" ] && { echo "Downloaded file empty"; rm "$temp_list"; return 1; }
 
-    if ! file "$IP_LIST_RAW" | grep -q "gzip compressed data"; then
-        echo "Not a valid gzip archive ($fetch_url)"
+    # Decompress
+    local file_type
+    file_type=$(file "$IP_LIST_RAW")
+    if echo "$file_type" | grep -q "gzip compressed data"; then
+        gunzip -c "$IP_LIST_RAW" > "$temp_list" || { echo "Failed to decompress gzip"; rm "$temp_list"; return 1; }
+    elif echo "$file_type" | grep -q "Zip archive"; then
+        command -v unzip >/dev/null || { echo "Error: unzip required"; rm "$temp_list"; return 1; }
+        unzip -p "$IP_LIST_RAW" > "$temp_list" || { echo "Failed to decompress zip"; rm "$temp_list"; return 1; }
+    elif echo "$file_type" | grep -q "7-zip archive"; then
+        command -v 7z >/dev/null || { echo "Error: 7z required"; rm "$temp_list"; return 1; }
+        7z e -so "$IP_LIST_RAW" > "$temp_list" || { echo "Failed to decompress 7z"; rm "$temp_list"; return 1; }
+    else
+        echo "Unsupported archive format"
+        rm "$temp_list"
         return 1
     fi
+    [ ! -s "$temp_list" ] && { echo "Decompressed file empty"; rm "$temp_list"; return 1; }
 
-    if ! gunzip -c "$IP_LIST_RAW" > "$temp_list"; then
-        echo "Failed to decompress ($fetch_url)"
-        return 1
-    fi
-    if [ ! -s "$temp_list" ]; then
-        echo "Decompressed file is empty ($fetch_url)"
-        return 1
-    fi
-    [ -n "$DEBUG_MODE" ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Decompressed size: $(stat -c %s "$temp_list") bytes" >&2
-    [ -n "$DEBUG_MODE" ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: First 10 lines of $temp_list:" >&2
-    [ -n "$DEBUG_MODE" ] && [ "$DEBUG_MODE" -eq 1 ] && head -n 10 "$temp_list" >&2
-
-    local cidr_count
-    cidr_count=$(awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]{1,2}|-([0-9]{1,3}\.){3}[0-9]{1,3}|$)/ {
-        if ($1 ~ /\//) {
-            split($1, a, "/");
-            ip = a[1];
-            mask = a[2];
-            if (mask >= 1 && mask <= 32) {
-                print $1
-            }
-        } else if ($1 ~ /-/) {
-            print $1
-        } else {
-            print $1 "/32"
-        }
-    }' "$temp_list" | tee -a "$IP_LIST" | wc -l)
-    [ -n "$DEBUG_MODE" ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Found $cidr_count CIDRs in $temp_list" >&2
+    # Parse
+    parse_blocklist "$conf_file" "$temp_list"
+    local status=$?
+    rm "$temp_list"
+    return $status
 }
 
-update_blocklist() {
-    setup_config_dir
-    if [ ! -d "$CONFIG_DIR" ] || ! ls "$CONFIG_DIR"/*.conf >/dev/null 2>&1; then
-        echo "No blocklist configs found in $CONFIG_DIR. Use --config to add one."
-        exit 1
+# Create ipset or nftables set
+create_set() {
+    local family="$1" set_name="$2" hashsize="$3"
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        # Create ipset for IPv4 or IPv6 with maxelem
+        sudo ipset create "$set_name" hash:ip hashsize "$hashsize" family "$family" maxelem 524288 2>/dev/null
+    else
+        # Create nftables set
+        if [ "$family" = "inet" ]; then
+            sudo nft add set ip filter "$set_name" "{ type ipv4_addr; flags interval; }" 2>/dev/null
+        else
+            sudo nft add set ip6 filter "$set_name" "{ type ipv6_addr; flags interval; }" 2>/dev/null
+        fi
     fi
+}
+
+# Add CIDRs to set
+add_to_set() {
+    local family="$1" cidr="$2" set_name="$3"
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        echo "add $set_name $cidr" >> "$IPSET_RESTORE_FILE"
+        [ "$DEBUG_MODE" -eq 1 ] && [ "$(wc -l < "$IPSET_RESTORE_FILE")" -le 5 ] && echo "DEBUG: Adding $cidr to $set_name" >&2
+    else
+        sudo nft add element ip filter "$set_name" "{ $cidr }" 2>/dev/null || \
+        sudo nft add element ip6 filter "$set_name" "{ $cidr }" 2>/dev/null
+    fi
+}
+
+# Apply set changes
+apply_set() {
+    local set_name="$1"
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Applying ipset restore from $IPSET_RESTORE_FILE" >&2
+        sudo ipset restore < "$IPSET_RESTORE_FILE" || {
+            [ "$DEBUG_MODE" -eq 1 ] && {
+                echo "DEBUG: Last 5 lines of $IPSET_RESTORE_FILE:" >&2
+                tail -n 5 "$IPSET_RESTORE_FILE" >&2
+            }
+            return 1
+        }
+    fi
+    return 0
+}
+
+# Backup existing set
+backup_set() {
+    local set_name="$1"
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Backing up ipset $set_name to $IPSET_BACKUP_FILE" >&2
+        sudo ipset save "$set_name" -file "$IPSET_BACKUP_FILE" 2>/dev/null
+    else
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Backing up nft set $set_name to $IPSET_BACKUP_FILE" >&2
+        sudo nft list set ip filter "$set_name" > "$IPSET_BACKUP_FILE" 2>/dev/null || \
+        sudo nft list set ip6 filter "$set_name" > "$IPSET_BACKUP_FILE" 2>/dev/null
+    fi
+}
+
+# Apply firewall rule
+apply_rule() {
+    local family="$1" set_name="$2"
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        if [ "$family" = "inet" ]; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Checking/adding iptables rule for $set_name" >&2
+            sudo iptables -C "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP 2>/dev/null || \
+            sudo iptables -I "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Checking/adding ip6tables rule for $set_name" >&2
+            sudo ip6tables -C "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP 2>/dev/null || \
+            sudo ip6tables -I "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP
+        fi
+    else
+        if [ "$family" = "inet" ]; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Adding nft rule for $set_name (IPv4)" >&2
+            sudo nft add rule ip filter "$IPTABLES_CHAIN" ip saddr "@$set_name" drop 2>/dev/null
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Adding nft rule for $set_name (IPv6)" >&2
+            sudo nft add rule ip6 filter "$IPTABLES_CHAIN" ip6 saddr "@$set_name" drop 2>/dev/null
+        fi
+    fi
+}
+
+# Update blocklist
+update_blocklist() {
+    local dry_run="$1"
+    check_sudo
+    check_dependencies
+    setup_config_dir
+    [ ! -d "$CONFIG_DIR" ] || ! ls "$CONFIG_DIR"/*.conf >/dev/null 2>&1 && { echo "No configs in $CONFIG_DIR. Use --config"; exit 1; }
 
     : > "$IP_LIST"
-
-    total_cidr=0
-    dupes=0
+    local total_cidr=0
     for conf_file in "$CONFIG_DIR"/*.conf; do
         if [ -f "$conf_file" ]; then
             echo "Processing $conf_file..."
             if process_blocklist "$conf_file"; then
-                cidrs=$(grep -cE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2}|-([0-9]{1,3}\.){3}[0-9]{1,3}|$)' "$IP_LIST")
-                echo "Added $cidrs CIDRs from $conf_file"
+                local cidrs=$(grep -c '^inet' "$IP_LIST")
+                [ "$IPV6_ENABLED" -eq 1 ] && cidrs=$((cidrs + $(grep -c '^inet6' "$IP_LIST")))
                 total_cidr=$((total_cidr + cidrs))
             fi
         fi
     done
 
-    if [ ! -s "$IP_LIST" ]; then
-        echo "No valid CIDRs retrieved."
-        exit 1
-    fi
+    [ ! -s "$IP_LIST" ] && { echo "No valid CIDRs retrieved"; exit 1; }
 
     echo "First 5 lines of merged list:"
     head -n 5 "$IP_LIST"
-    echo "Total valid CIDRs:"
-    echo "$total_cidr"
+    echo "Total valid CIDRs: $total_cidr"
     echo "Duplicate CIDRs:"
-    dupes=$(awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]{1,2}|-([0-9]{1,3}\.){3}[0-9]{1,3}|$)/ {print $1}' "$IP_LIST" | sort -n -t . -k 1,1 -k 2,2 -k 3,3 -k 4,4 | uniq -d | wc -l)
+    local dupes=$(sort "$IP_LIST" | uniq -d | wc -l)
     echo "$dupes"
     echo "------------------------"
 
-    echo "Need sudo to remove existing iptables rule and ipset."
-    sudo iptables -D INPUT -m set --match-set blacklist src -j DROP 2>/dev/null
-    sudo ipset destroy blacklist 2>/dev/null
+    [ "$dry_run" -eq 1 ] && { echo "Dry run: Would apply $((total_cidr - dupes)) entries"; return 0; }
 
-    if ! sudo ipset create blacklist hash:net hashsize 65536; then
-        echo "Failed to create ipset 'blacklist'"
-        exit 1
+    # Clean up existing rules
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Removing existing iptables rules" >&2
+        sudo iptables -D "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null
+        [ "$IPV6_ENABLED" -eq 1 ] && sudo ip6tables -D "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>/dev/null
+    else
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Removing existing nft rules" >&2
+        sudo nft delete rule ip filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip filter "$IPTABLES_CHAIN" | grep "set $IPSET_NAME" | awk '{print $NF}') 2>/dev/null
+        [ "$IPV6_ENABLED" -eq 1 ] && sudo nft delete rule ip6 filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip6 filter "$IPTABLES_CHAIN" | grep "set ${IPSET_NAME}_v6" | awk '{print $NF}') 2>/dev/null
     fi
 
-    echo "flush blacklist" > "$IPSET_RESTORE_FILE"
-    awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]{1,2}|-([0-9]{1,3}\.){3}[0-9]{1,3}|$)/ {
-        if ($1 ~ /\//) {
-            split($1, a, "/");
-            ip = a[1];
-            mask = a[2];
-            if (mask >= 1 && mask <= 32) {
-                print "add blacklist " $1
-            }
-        } else if ($1 ~ /-/) {
-            split($1, a, "-");
-            print "add blacklist " a[1]
-        } else {
-            print "add blacklist " $1 "/32"
+    # Backup and destroy sets
+    backup_set "$IPSET_NAME"
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Destroying ipset $IPSET_NAME" >&2
+        sudo ipset destroy "$IPSET_NAME" 2>/dev/null
+        [ "$IPV6_ENABLED" -eq 1 ] && {
+            backup_set "${IPSET_NAME}_v6"
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Destroying ipset ${IPSET_NAME}_v6" >&2
+            sudo ipset destroy "${IPSET_NAME}_v6" 2>/dev/null
         }
-    }' "$IP_LIST" | sort -n -t . -k 1,1 -k 2,2 -k 3,3 -k 4,4 | uniq >> "$IPSET_RESTORE_FILE"
+    else
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting nft set $IPSET_NAME" >&2
+        sudo nft delete set ip filter "$IPSET_NAME" 2>/dev/null
+        [ "$IPV6_ENABLED" -eq 1 ] && {
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting nft set ${IPSET_NAME}_v6" >&2
+            sudo nft delete set ip6 filter "${IPSET_NAME}_v6" 2>/dev/null
+        }
+    fi
 
-    echo "Applying ipset restore ($((total_cidr - dupes)) unique entries)"
-    if ! sudo ipset restore < "$IPSET_RESTORE_FILE"; then
-        echo "Failed to apply ipset restore"
+    # Create sets
+    local hashsize=$((total_cidr / 2))
+    [ $hashsize -lt 1024 ] && hashsize=1024
+    [ $hashsize -gt 1048576 ] && hashsize=1048576
+    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Creating ipset $IPSET_NAME with hashsize $hashsize" >&2
+    create_set inet "$IPSET_NAME" "$hashsize"
+    [ "$IPV6_ENABLED" -eq 1 ] && {
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Creating ipset ${IPSET_NAME}_v6 with hashsize $hashsize" >&2
+        create_set inet6 "${IPSET_NAME}_v6" "$hashsize"
+    }
+
+    # Populate sets
+    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Populating ipset $IPSET_NAME" >&2
+    echo "flush $IPSET_NAME" > "$IPSET_RESTORE_FILE"
+    [ "$IPV6_ENABLED" -eq 1 ] && echo "flush ${IPSET_NAME}_v6" >> "$IPSET_RESTORE_FILE"
+    sort "$IP_LIST" | uniq | while IFS=' ' read -r family cidr; do
+        if [ "$family" = "inet" ]; then
+            # Skip if CIDR already exists
+            if ! sudo ipset test "$IPSET_NAME" "$cidr" 2>/dev/null; then
+                add_to_set inet "$cidr" "$IPSET_NAME"
+            else
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping duplicate CIDR $cidr in $IPSET_NAME" >&2
+            fi
+        elif [ "$family" = "inet6" ]; then
+            if ! sudo ipset test "${IPSET_NAME}_v6" "$cidr" 2>/dev/null; then
+                add_to_set inet6 "$cidr" "${IPSET_NAME}_v6"
+            else
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping duplicate CIDR $cidr in ${IPSET_NAME}_v6" >&2
+            fi
+        fi
+    done
+
+    # Apply sets
+    echo "Applying $((total_cidr - dupes)) unique entries"
+    if ! apply_set "$IPSET_NAME"; then
+        echo "Failed to apply set; restoring backup"
+        if [ -s "$IPSET_BACKUP_FILE" ]; then
+            if [ "$FIREWALL_BACKEND" = "iptables" ] && sudo ipset restore < "$IPSET_BACKUP_FILE" 2>/dev/null; then
+                echo "Restored previous state"
+                apply_rule inet "$IPSET_NAME"
+                [ "$IPV6_ENABLED" -eq 1 ] && apply_rule inet6 "${IPSET_NAME}_v6"
+                exit 1
+            else
+                echo "Failed to restore backup"
+            fi
+        fi
+        if [ "$NON_INTERACTIVE" -eq 1 ]; then
+            [ "$NON_INTERACTIVE_CONTINUE_NO_BACKUP" = "y" ] && { echo "Proceeding without blacklist"; exit 0; }
+        else
+            read -p "Exit without applying blacklist? (y/N): " continue_no_backup
+            [[ "$continue_no_backup" =~ ^[Yy]$ ]] && { echo "Proceeding without blacklist"; exit 0; }
+        fi
         exit 1
     fi
 
-    added=$(sudo ipset list blacklist | grep -c '[0-9]\.[0-9]')
-    echo "Added $added entries to blacklist"
-    if [ "$added" -lt 40000 ]; then
-        echo "Warning: Added fewer entries than expected (<40000)"
+    # Verify
+    local added=0
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Verifying ipset $IPSET_NAME entries" >&2
+        added=$(sudo ipset list "$IPSET_NAME" | grep -c '[0-9]\.[0-9]')
+        [ "$IPV6_ENABLED" -eq 1 ] && {
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Verifying ipset ${IPSET_NAME}_v6 entries" >&2
+            added=$((added + $(sudo ipset list "${IPSET_NAME}_v6" | grep -c '[0-9a-fA-F:]')))
+        }
+    else
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Verifying nft set $IPSET_NAME entries" >&2
+        added=$(sudo nft list set ip filter "$IPSET_NAME" | grep -c '[0-9]\.[0-9]')
+        [ "$IPV6_ENABLED" -eq 1 ] && {
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Verifying nft set ${IPSET_NAME}_v6 entries" >&2
+            added=$((added + $(sudo nft list set ip6 filter "${IPSET_NAME}_v6" | grep -c '[0-9a-fA-F:]')))
+        }
     fi
+    echo "Added $added entries"
+    [ "$added" -lt $((total_cidr / 2)) ] && echo "Warning: Fewer entries than expected"
 
-    echo "Need sudo to apply iptables rule."
-    if ! sudo iptables -C INPUT -m set --match-set blacklist src -j DROP 2>/dev/null; then
-        if ! sudo iptables -I INPUT -m set --match-set blacklist src -j DROP; then
-            echo "Failed to apply iptables rule"
-            exit 1
+    # Check for critical rules (e.g., SSH)
+    local rule_pos=1
+    if [ "$FIREWALL_BACKEND" = "iptables" ] && sudo iptables -L "$IPTABLES_CHAIN" -n | grep -q "ACCEPT.*tcp dpt:22"; then
+        if [ "$NON_INTERACTIVE" -eq 1 ]; then
+            [ "$NON_INTERACTIVE_CONTINUE_IPTABLES" = "y" ] && rule_pos=2
+        else
+            echo "Warning: Critical rule (e.g., SSH) detected"
+            read -p "Insert rule anyway? (y/N): " continue_iptables
+            [[ "$continue_iptables" =~ ^[Yy]$ ]] && rule_pos=2
         fi
     fi
 
+    # Apply rules
+    apply_rule inet "$IPSET_NAME"
+    [ "$IPV6_ENABLED" -eq 1 ] && apply_rule inet6 "${IPSET_NAME}_v6"
     echo "Blocklist applied successfully"
 }
 
+# Main script
+LOCK_FILE="/tmp/blocklist.lock"
+[ ! -w "$(dirname "$LOCK_FILE")" ] && { echo "Error: Cannot write to lock file dir"; exit 1; }
+touch "$LOCK_FILE" 2>/dev/null || { echo "Error: Cannot create $LOCK_FILE"; exit 1; }
+exec 9> "$LOCK_FILE" || { echo "Error: Failed to open lock file"; exit 1; }
+flock -n 9 || { echo "Error: Another instance is running"; exit 1; }
+
+# Initialize modes
+load_config
+setup_temp_files
 DEBUG_MODE=0
+VERBOSE_DEBUG=0
 LOG_MODE=0
+DRY_RUN=0
+IPV6_ENABLED=0
+NON_INTERACTIVE=0
 ACTIONS=()
 
+# Parse options
 while [ $# -gt 0 ]; do
     case "$1" in
-        --help)
-            ACTIONS+=("help")
-            ;;
-        --config)
-            ACTIONS+=("config")
-            ;;
-        --auth)
-            ACTIONS+=("auth")
-            ;;
-        --purge)
-            ACTIONS+=("purge")
-            ;;
-        --debug)
-            DEBUG_MODE=1
-            ;;
-        --log)
-            LOG_MODE=1
-            ;;
-        *)
-            echo "Unknown option: $1"
-            show_help
-            exit 1
-            ;;
+        --help) ACTIONS+=("help");;
+        --config) ACTIONS+=("config");;
+        --auth) ACTIONS+=("auth");;
+        --purge) ACTIONS+=("purge");;
+        --debug) DEBUG_MODE=1;;
+        --verbosedebug) DEBUG_MODE=1; VERBOSE_DEBUG=1;;
+        --log) LOG_MODE=1;;
+        --dry-run) DRY_RUN=1;;
+        --ipv6) IPV6_ENABLED=1;;
+        --backend) shift; FIREWALL_BACKEND="$1";;
+        --non-interactive) NON_INTERACTIVE=1;;
+        *) echo "Unknown option: $1"; show_help; exit 1;;
     esac
     shift
 done
 
-if [ "$DEBUG_MODE" -eq 1 ]; then
-    set -x
-fi
-
+[ "$VERBOSE_DEBUG" -eq 1 ] && set -x
 if [ "$LOG_MODE" -eq 1 ]; then
+    touch "$LOG_FILE" 2>/dev/null || { echo "Error: Cannot write to $LOG_FILE"; exit 1; }
+    chmod 600 "$LOG_FILE"
+    [ -f "$LOG_FILE" ] && cp -f "$LOG_FILE" "${LOG_FILE}.bak"
     exec > >(tee -a "$LOG_FILE") 2>&1
     echo "Logging to $LOG_FILE"
 fi
 
-if [ ${#ACTIONS[@]} -eq 0 ]; then
-    ACTIONS+=("update")
-fi
+[ -n "$CRON" ] && { sudo -n true || { echo "Cron error: Sudo requires password"; exit 1; }; }
+
+[ ${#ACTIONS[@]} -eq 0 ] && ACTIONS+=("update")
 
 for action in "${ACTIONS[@]}"; do
     case "$action" in
-        help)
-            show_help
-            ;;
-        config)
-            manage_configs
-            ;;
-        auth)
-            manage_credentials
-            ;;
-        purge)
-            purge_blocklist
-            ;;
-        update)
-            load_credentials
-            update_blocklist
-            ;;
+        help) show_help;;
+        config) manage_configs;;
+        auth) manage_credentials;;
+        purge) purge_blocklist;;
+        update) load_credentials; update_blocklist "$DRY_RUN";;
     esac
 done
