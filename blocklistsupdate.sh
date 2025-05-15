@@ -42,7 +42,7 @@
 # Most current version as of this edit: 4.6.4
 
 # Supports iptables/nftables, IPv4/IPv6, multiple blocklist sources, and configurable settings
-# Version 2.0: Added IPv6 support, nftables backend, centralized config, non-interactive mode
+# Version 2.5: Optimized CIDR parsing, improved ipset handling, enhanced debugging, normalized CIDRs
 
 # Inspired from https://lowendspirit.com/discussion/7699/use-a-blacklist-of-bad-ips-on-your-linux-firewall-tutorial
 # Credit to user itsdeadjim ( https://lowendspirit.com/profile/itsdeadjim )
@@ -104,18 +104,18 @@ EOF
 setup_temp_files() {
     IP_LIST_RAW=$(mktemp /tmp/iplist_raw.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
     IP_LIST=$(mktemp /tmp/iplist.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
-    IPSET_RESTORE_FILE=$(mktemp /tmp/ipset_restore.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
     IPSET_BACKUP_FILE=$(mktemp /tmp/ipset_backup.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
-    chmod 600 "$IP_LIST_RAW" "$IP_LIST" "$IPSET_RESTORE_FILE" "$IPSET_BACKUP_FILE"
+    chmod 600 "$IP_LIST_RAW" "$IP_LIST" "$IPSET_BACKUP_FILE"
 }
 
 # Cleanup temporary files on exit
 cleanup() {
-    rm -f "$IP_LIST_RAW" "$IP_LIST" "$IPSET_RESTORE_FILE" "$IPSET_BACKUP_FILE" /tmp/iplist_*.txt
+    rm -f "$IP_LIST_RAW" "$IP_LIST" "$IPSET_RESTORE_FILE" "$IPSET_BACKUP_FILE" /tmp/iplist_*.txt /tmp/ipset_commands.*
+    [ "$DEBUG_MODE" -eq 1 ] && echo "Script exited at: $(date)"
 }
 trap cleanup EXIT
 
-# Display usage information
+# Display usage information (Modified: Added --ipset-test with performance notice)
 show_help() {
     echo "Usage: $0 [OPTIONS]"
     echo "Options:"
@@ -130,6 +130,7 @@ show_help() {
     echo "  --ipv6        Process IPv6 addresses (default: IPv4 only)"
     echo "  --backend     Set firewall backend (iptables/nftables, default: $FIREWALL_BACKEND)"
     echo "  --non-interactive  Suppress prompts, use config defaults"
+    echo "  --ipset-test  Enable ipset test to skip duplicates (may add ~5-10 seconds for 1,500 duplicates)"
 }
 
 # Check for required dependencies
@@ -457,10 +458,10 @@ download_blocklist() {
     return 1
 }
 
-# Parse blocklist file
+# Parse blocklist file (Modified: Added CIDR normalization) (Modified again: Added buffer to variable and only write to disk every 1,000 entries)
 parse_blocklist() {
     local conf_file="$1" temp_list="$2"
-    local cidr_count=0 skipped_count=0
+    local cidr_count=0 skipped_empty=0 skipped_comments=0 batch=""
     # Debug: Show first 5 lines to inspect file format
     [ "$DEBUG_MODE" -eq 1 ] && {
         echo "DEBUG: First 5 lines of $temp_list:" >&2
@@ -470,13 +471,13 @@ parse_blocklist() {
     while IFS= read -r line || [ -n "$line" ]; do
         # Check for comments and empty lines before trimming
         [[ "$line" =~ ^[[:space:]]*$ ]] && {
-            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping empty line in $conf_file" >&2
-            skipped_count=$((skipped_count + 1))
+            [ "$VERBOSE_DEBUG" -eq 1 ] && echo "DEBUG: Skipping empty line in $conf_file" >&2
+            skipped_empty=$((skipped_empty + 1))
             continue
         }
         [[ "$line" =~ ^[[:space:]]*# ]] && {
-            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping comment: $line" >&2
-            skipped_count=$((skipped_count + 1))
+            [ "$VERBOSE_DEBUG" -eq 1 ] && echo "DEBUG: Skipping comment: $line" >&2
+            skipped_comments=$((skipped_comments + 1))
             continue
         }
         # Trim leading/trailing whitespace
@@ -489,7 +490,11 @@ parse_blocklist() {
         if [[ "$range" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
             range="${range%/32}" # Normalize single IPs
             if validate_cidr "$range" inet; then
-                echo "inet $range" >> "$IP_LIST"
+                # Ensure consistent format (always add /32 for single IPs)
+                if [[ ! "$range" =~ /[0-9]+$ ]]; then
+                    range="$range/32"
+                fi
+                batch="$batch\ninet $range"
                 cidr_count=$((cidr_count + 1))
                 [ "$DEBUG_MODE" -eq 1 ] && [ $((cidr_count % 10000)) -eq 0 ] && echo "DEBUG: Processed $cidr_count CIDRs in $conf_file" >&2
             else
@@ -499,7 +504,11 @@ parse_blocklist() {
         elif [ "$IPV6_ENABLED" -eq 1 ] && [[ "$range" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]]; then
             range="${range%/128}" # Normalize single IPs
             if validate_cidr "$range" inet6; then
-                echo "inet6 $range" >> "$IP_LIST"
+                # Ensure consistent format (always add /128 for single IPs)
+                if [[ ! "$range" =~ /[0-9]+$ ]]; then
+                    range="$range/128"
+                fi
+                batch="$batch\ninet6 $range"
                 cidr_count=$((cidr_count + 1))
                 [ "$DEBUG_MODE" -eq 1 ] && [ $((cidr_count % 10000)) -eq 0 ] && echo "DEBUG: Processed $cidr_count CIDRs in $conf_file" >&2
             else
@@ -518,9 +527,16 @@ parse_blocklist() {
         else
             echo "Skipping non-CIDR in $conf_file: $range"
         fi
+        # Write batch every 1,000 lines to balance memory and I/O
+        if [ $((cidr_count % 1000)) -eq 0 ]; then
+            echo -e "$batch" | sed '/^$/d' >> "$IP_LIST"  # Remove empty lines from batch
+            batch=""
+        fi
     done < "$temp_list"
+    # Write any remaining lines
+    [ -n "$batch" ] && echo -e "$batch" | sed '/^$/d' >> "$IP_LIST"
     [ "$DEBUG_MODE" -eq 1 ] && {
-        echo "DEBUG: Found $cidr_count CIDRs, skipped $skipped_count lines in $temp_list" >&2
+        echo "DEBUG: Found $cidr_count CIDRs, skipped $skipped_empty empty lines, $skipped_comments comments in $temp_list" >&2
     }
     echo "Added $cidr_count CIDRs from $conf_file"
     if [ "$cidr_count" -eq 0 ]; then
@@ -532,7 +548,8 @@ parse_blocklist() {
 # Process a single blocklist
 process_blocklist() {
     local conf_file="$1"
-    local temp_list=$(mktemp /tmp/iplist_$(basename "$conf_file").XXXXXX) || { echo "Error: Failed to create temp file"; return 1; }
+    local temp_list
+    temp_list=$(mktemp /tmp/iplist_$(basename "$conf_file").XXXXXX) || { echo "Error: Failed to create temp file"; return 1; }
     chmod 600 "$temp_list"
 
     # Parse config
@@ -540,7 +557,7 @@ process_blocklist() {
     URL=$(grep '^URL=' "$conf_file" | cut -d= -f2-)
     USERNAME=$(grep '^USERNAME=' "$conf_file" | cut -d= -f2-)
     PIN=$(grep '^PIN=' "$conf_file" | cut -d= -f2-)
-    [ -z "$URL" ] && { echo "Skipping $conf_file: No URL"; rm "$temp_list"; return 1; }
+    [ -z "$URL" ] && { echo "Skipping $conf_file: No URL"; rm -f "$temp_list"; return 1; }
     local clean_url stripped_user stripped_pin
     read clean_url stripped_user stripped_pin < <(sanitize_url "$URL" | tr '|' ' ')
     if [ -n "$stripped_user" ] || [ -n "$stripped_pin" ]; then
@@ -561,43 +578,57 @@ process_blocklist() {
     fi
 
     # Download
+    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Downloading blocklist from $fetch_url to $IP_LIST_RAW" >&2
     if ! download_blocklist "$fetch_url" "$IP_LIST_RAW"; then
-        rm "$temp_list"
+        rm -f "$temp_list"
         return 1
     fi
-    [ ! -s "$IP_LIST_RAW" ] && { echo "Downloaded file empty"; rm "$temp_list"; return 1; }
+    [ ! -s "$IP_LIST_RAW" ] && { echo "Downloaded file empty"; rm -f "$temp_list"; return 1; }
+    [ "$DEBUG_MODE" -eq 1 ] && {
+        local file_size
+        if [ "$(uname -s)" = "Linux" ]; then
+            file_size=$(stat --format="%s" "$IP_LIST_RAW" 2>/dev/null)
+        else
+            file_size=$(stat -f %z "$IP_LIST_RAW" 2>/dev/null)
+        fi
+        echo "DEBUG: Downloaded file size: $file_size bytes" >&2
+    }
+    [ "$VERBOSE_DEBUG" -eq 1 ] && {
+        echo "DEBUG: Detailed file stats:" >&2
+        stat "$IP_LIST_RAW" >&2
+    }
 
     # Decompress
     local file_type
     file_type=$(file "$IP_LIST_RAW")
     if echo "$file_type" | grep -q "gzip compressed data"; then
-        gunzip -c "$IP_LIST_RAW" > "$temp_list" || { echo "Failed to decompress gzip"; rm "$temp_list"; return 1; }
+        gunzip -c "$IP_LIST_RAW" > "$temp_list" || { echo "Failed to decompress gzip"; rm -f "$temp_list"; return 1; }
     elif echo "$file_type" | grep -q "Zip archive"; then
-        command -v unzip >/dev/null || { echo "Error: unzip required"; rm "$temp_list"; return 1; }
-        unzip -p "$IP_LIST_RAW" > "$temp_list" || { echo "Failed to decompress zip"; rm "$temp_list"; return 1; }
+        command -v unzip >/dev/null || { echo "Error: unzip required"; rm -f "$temp_list"; return 1; }
+        unzip -p "$IP_LIST_RAW" > "$temp_list" || { echo "Failed to decompress zip"; rm -f "$temp_list"; return 1; }
     elif echo "$file_type" | grep -q "7-zip archive"; then
-        command -v 7z >/dev/null || { echo "Error: 7z required"; rm "$temp_list"; return 1; }
-        7z e -so "$IP_LIST_RAW" > "$temp_list" || { echo "Failed to decompress 7z"; rm "$temp_list"; return 1; }
+        command -v 7z >/dev/null || { echo "Error: 7z required"; rm -f "$temp_list"; return 1; }
+        7z e -so "$IP_LIST_RAW" > "$temp_list" || { echo "Failed to decompress 7z"; rm -f "$temp_list"; return 1; }
     else
         echo "Unsupported archive format"
-        rm "$temp_list"
+        rm -f "$temp_list"
         return 1
     fi
-    [ ! -s "$temp_list" ] && { echo "Decompressed file empty"; rm "$temp_list"; return 1; }
+    [ ! -s "$temp_list" ] && { echo "Decompressed file empty"; rm -f "$temp_list"; return 1; }
 
     # Parse
     parse_blocklist "$conf_file" "$temp_list"
     local status=$?
-    rm "$temp_list"
+    rm -f "$temp_list"
     return $status
 }
 
-# Create ipset or nftables set
+# Create ipset or nftables set (Optimization 4: Increase hash size to total_cidr)
 create_set() {
     local family="$1" set_name="$2" hashsize="$3"
     if [ "$FIREWALL_BACKEND" = "iptables" ]; then
-        # Create ipset for IPv4 or IPv6 with maxelem
-        sudo ipset create "$set_name" hash:ip hashsize "$hashsize" family "$family" maxelem 524288 2>/dev/null
+        # Increase maxelem to 1,048,576 and ensure hashsize is sufficient
+        sudo ipset create "$set_name" hash:ip hashsize "$hashsize" family "$family" maxelem 1048576 2>/dev/null
     else
         # Create nftables set
         if [ "$family" = "inet" ]; then
@@ -608,31 +639,22 @@ create_set() {
     fi
 }
 
-# Add CIDRs to set
+# Add CIDRs to set (Modified for Optimization 3: Return the command instead of writing to file)
 add_to_set() {
     local family="$1" cidr="$2" set_name="$3"
     if [ "$FIREWALL_BACKEND" = "iptables" ]; then
-        echo "add $set_name $cidr" >> "$IPSET_RESTORE_FILE"
-        [ "$DEBUG_MODE" -eq 1 ] && [ "$(wc -l < "$IPSET_RESTORE_FILE")" -le 5 ] && echo "DEBUG: Adding $cidr to $set_name" >&2
+        echo "add $set_name $cidr"
+        [ "$DEBUG_MODE" -eq 1 ] && [ "$cidr_count" -le 5 ] && echo "DEBUG: Adding $cidr to $set_name" >&2
     else
         sudo nft add element ip filter "$set_name" "{ $cidr }" 2>/dev/null || \
         sudo nft add element ip6 filter "$set_name" "{ $cidr }" 2>/dev/null
     fi
 }
 
-# Apply set changes
+# Apply set changes (Simplified for Optimization 3: Handled in update_blocklist)
 apply_set() {
     local set_name="$1"
-    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
-        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Applying ipset restore from $IPSET_RESTORE_FILE" >&2
-        sudo ipset restore < "$IPSET_RESTORE_FILE" || {
-            [ "$DEBUG_MODE" -eq 1 ] && {
-                echo "DEBUG: Last 5 lines of $IPSET_RESTORE_FILE:" >&2
-                tail -n 5 "$IPSET_RESTORE_FILE" >&2
-            }
-            return 1
-        }
-    fi
+    # ipset restore is now handled in update_blocklist
     return 0
 }
 
@@ -673,7 +695,7 @@ apply_rule() {
     fi
 }
 
-# Update blocklist
+# Update blocklist (Modified: Added LC_ALL=C, whitespace trimming, and ipset test flag)
 update_blocklist() {
     local dry_run="$1"
     check_sudo
@@ -685,7 +707,7 @@ update_blocklist() {
     local total_cidr=0
     for conf_file in "$CONFIG_DIR"/*.conf; do
         if [ -f "$conf_file" ]; then
-            echo "Processing $conf_file..."
+            echo "Processing $conf_file... (at $(date))"
             if process_blocklist "$conf_file"; then
                 local cidrs=$(grep -c '^inet' "$IP_LIST")
                 [ "$IPV6_ENABLED" -eq 1 ] && cidrs=$((cidrs + $(grep -c '^inet6' "$IP_LIST")))
@@ -700,7 +722,7 @@ update_blocklist() {
     head -n 5 "$IP_LIST"
     echo "Total valid CIDRs: $total_cidr"
     echo "Duplicate CIDRs:"
-    local dupes=$(sort "$IP_LIST" | uniq -d | wc -l)
+    local dupes=$(LC_ALL=C sort "$IP_LIST" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | uniq -d | wc -l)
     echo "$dupes"
     echo "------------------------"
 
@@ -736,10 +758,10 @@ update_blocklist() {
         }
     fi
 
-    # Create sets
-    local hashsize=$((total_cidr / 2))
+    # Create sets (Optimization 4: Use total_cidr for hashsize)
+    local hashsize="$total_cidr"
     [ $hashsize -lt 1024 ] && hashsize=1024
-    [ $hashsize -gt 1048576 ] && hashsize=1048576
+    [ $hashsize -gt 1048576 ] && hashsize=1048576  # Cap at 1,048,576
     [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Creating ipset $IPSET_NAME with hashsize $hashsize" >&2
     create_set inet "$IPSET_NAME" "$hashsize"
     [ "$IPV6_ENABLED" -eq 1 ] && {
@@ -747,31 +769,71 @@ update_blocklist() {
         create_set inet6 "${IPSET_NAME}_v6" "$hashsize"
     }
 
-    # Populate sets
+    # Populate sets (Modified: Added LC_ALL=C, whitespace trimming, and ipset test flag)
     [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Populating ipset $IPSET_NAME" >&2
-    echo "flush $IPSET_NAME" > "$IPSET_RESTORE_FILE"
-    [ "$IPV6_ENABLED" -eq 1 ] && echo "flush ${IPSET_NAME}_v6" >> "$IPSET_RESTORE_FILE"
-    sort "$IP_LIST" | uniq | while IFS=' ' read -r family cidr; do
+    TMP_SCRIPT=$(mktemp /tmp/ipset_commands.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
+    chmod 600 "$TMP_SCRIPT"
+    echo "flush $IPSET_NAME" > "$TMP_SCRIPT"
+    [ "$IPV6_ENABLED" -eq 1 ] && echo "flush ${IPSET_NAME}_v6" >> "$TMP_SCRIPT"
+    cidr_count=0
+    LC_ALL=C sort "$IP_LIST" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | uniq | while IFS=' ' read -r family cidr; do
         if [ "$family" = "inet" ]; then
-            # Skip if CIDR already exists
-            if ! sudo ipset test "$IPSET_NAME" "$cidr" 2>/dev/null; then
-                add_to_set inet "$cidr" "$IPSET_NAME"
-            else
+            if [ "$IPSET_TEST" -eq 1 ] && sudo ipset test "$IPSET_NAME" "$cidr" 2>/dev/null; then
                 [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping duplicate CIDR $cidr in $IPSET_NAME" >&2
+            else
+                add_to_set inet "$cidr" "$IPSET_NAME"
             fi
         elif [ "$family" = "inet6" ]; then
-            if ! sudo ipset test "${IPSET_NAME}_v6" "$cidr" 2>/dev/null; then
-                add_to_set inet6 "$cidr" "${IPSET_NAME}_v6"
-            else
+            if [ "$IPSET_TEST" -eq 1 ] && sudo ipset test "${IPSET_NAME}_v6" "$cidr" 2>/dev/null; then
                 [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping duplicate CIDR $cidr in ${IPSET_NAME}_v6" >&2
+            else
+                add_to_set inet6 "$cidr" "${IPSET_NAME}_v6"
             fi
         fi
-    done
+        ((cidr_count++))
+    done >> "$TMP_SCRIPT"
+
+    # Check for previous ipset error log and display surrounding lines if it exists
+    if [ "$DEBUG_MODE" -eq 1 ]; then
+        script_name=$(basename "$0" .sh)
+        ipset_log="${script_name}_ipset.log"
+        if [ -f "$ipset_log" ]; then
+            error_line=$(grep '^Error line:' "$ipset_log" | sed 's/Error line: //')
+            if [ -n "$error_line" ]; then
+                start_line=$((error_line - 5))
+                end_line=$((error_line + 5))
+                [ $start_line -lt 1 ] && start_line=1
+                echo "DEBUG: Previous ipset error detected at line $error_line; showing lines $start_line-$end_line from $TMP_SCRIPT:" >&2
+                sed -n "${start_line},${end_line}p" "$TMP_SCRIPT" >&2
+            fi
+        fi
+    fi
 
     # Apply sets
     echo "Applying $((total_cidr - dupes)) unique entries"
-    if ! apply_set "$IPSET_NAME"; then
+    # Capture ipset restore output to check for errors
+    ipset_output=$(sudo ipset restore < "$TMP_SCRIPT" 2>&1)
+    ipset_status=$?
+    if [ $ipset_status -ne 0 ]; then
         echo "Failed to apply set; restoring backup"
+        # Extract the line number from ipset error message
+        error_line=$(echo "$ipset_output" | grep -o 'Error in line [0-9]*' | sed 's/Error in line //')
+        if [ -n "$error_line" ] && [ "$DEBUG_MODE" -eq 1 ]; then
+            # Create log file with script name
+            script_name=$(basename "$0" .sh)
+            ipset_log="${script_name}_ipset.log"
+            # Overwrite log file with explanation and line number
+            cat > "$ipset_log" << EOF
+# This file was created because ipset reported an error: duplicate CIDR detected.
+# The error occurred at line $error_line in the temporary ipset script.
+# To see the surrounding lines and identify the duplicate, rerun the script with:
+#   $0 --debug
+Error line: $error_line
+EOF
+            chmod 600 "$ipset_log"
+            echo "DEBUG: ipset error detected at line $error_line; details logged to $ipset_log" >&2
+            echo "DEBUG: Rerun with --debug to display the surrounding lines and identify the duplicate" >&2
+        fi
         if [ -s "$IPSET_BACKUP_FILE" ]; then
             if [ "$FIREWALL_BACKEND" = "iptables" ] && sudo ipset restore < "$IPSET_BACKUP_FILE" 2>/dev/null; then
                 echo "Restored previous state"
@@ -789,7 +851,18 @@ update_blocklist() {
             [[ "$continue_no_backup" =~ ^[Yy]$ ]] && { echo "Proceeding without blacklist"; exit 0; }
         fi
         exit 1
+    else
+        # ipset restore succeeded; clean up diagnostic log if it exists
+        if [ "$DEBUG_MODE" -eq 1 ]; then
+            script_name=$(basename "$0" .sh)
+            ipset_log="${script_name}_ipset.log"
+            if [ -f "$ipset_log" ]; then
+                rm "$ipset_log"
+                echo "DEBUG: ipset completed without errors in this run; erasing diagnostic log from previous error" >&2
+            fi
+        fi
     fi
+    rm "$TMP_SCRIPT"
 
     # Verify
     local added=0
@@ -829,7 +902,7 @@ update_blocklist() {
     echo "Blocklist applied successfully"
 }
 
-# Main script
+# Main script (Modified: Added --ipset-test flag and warning)
 LOCK_FILE="/tmp/blocklist.lock"
 [ ! -w "$(dirname "$LOCK_FILE")" ] && { echo "Error: Cannot write to lock file dir"; exit 1; }
 touch "$LOCK_FILE" 2>/dev/null || { echo "Error: Cannot create $LOCK_FILE"; exit 1; }
@@ -845,9 +918,10 @@ LOG_MODE=0
 DRY_RUN=0
 IPV6_ENABLED=0
 NON_INTERACTIVE=0
+IPSET_TEST=0  # New flag for ipset test
 ACTIONS=()
 
-# Parse options
+# Parse options (Modified: Added --ipset-test)
 while [ $# -gt 0 ]; do
     case "$1" in
         --help) ACTIONS+=("help");;
@@ -861,16 +935,23 @@ while [ $# -gt 0 ]; do
         --ipv6) IPV6_ENABLED=1;;
         --backend) shift; FIREWALL_BACKEND="$1";;
         --non-interactive) NON_INTERACTIVE=1;;
+        --ipset-test) IPSET_TEST=1; echo "Warning: --ipset-test enabled. This may add ~5-10 seconds for 1,500 duplicates.";;
         *) echo "Unknown option: $1"; show_help; exit 1;;
     esac
     shift
 done
+
+# Debug: Confirm debug mode settings
+[ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Debug modes - DEBUG_MODE=$DEBUG_MODE, VERBOSE_DEBUG=$VERBOSE_DEBUG" >&2
 
 [ "$VERBOSE_DEBUG" -eq 1 ] && set -x
 if [ "$LOG_MODE" -eq 1 ]; then
     touch "$LOG_FILE" 2>/dev/null || { echo "Error: Cannot write to $LOG_FILE"; exit 1; }
     chmod 600 "$LOG_FILE"
     [ -f "$LOG_FILE" ] && cp -f "$LOG_FILE" "${LOG_FILE}.bak"
+    if [ ! -t 1 ]; then  # Check if stdout is NOT a terminal (i.e., redirected)
+        echo "Warning: Output is already redirected (e.g., to a file); also logging to $LOG_FILE. Ctrl+C to cancel if undesired."
+    fi
     exec > >(tee -a "$LOG_FILE") 2>&1
     echo "Logging to $LOG_FILE"
 fi
@@ -878,6 +959,9 @@ fi
 [ -n "$CRON" ] && { sudo -n true || { echo "Cron error: Sudo requires password"; exit 1; }; }
 
 [ ${#ACTIONS[@]} -eq 0 ] && ACTIONS+=("update")
+
+# Display start time
+echo "Script started at: $(date)"
 
 for action in "${ACTIONS[@]}"; do
     case "$action" in
@@ -888,3 +972,6 @@ for action in "${ACTIONS[@]}"; do
         update) load_credentials; update_blocklist "$DRY_RUN";;
     esac
 done
+
+# Display completion time
+echo "Script completed at: $(date)"
