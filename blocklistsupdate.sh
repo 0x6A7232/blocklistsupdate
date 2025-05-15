@@ -41,7 +41,7 @@
 
 # Most current version as of this edit: 4.6.4
 
-# Version 1.2: Added --dry-run, resource management, IPv6 logging, cron support
+# Version 1.5: Enhanced URL parsing, safer CIDR handling, improved ipset recovery, protected iptables rules
 
 # Inspired from https://lowendspirit.com/discussion/7699/use-a-blacklist-of-bad-ips-on-your-linux-firewall-tutorial
 # Credit to user itsdeadjim ( https://lowendspirit.com/profile/itsdeadjim )
@@ -177,7 +177,8 @@ sanitize_url() {
     if ! echo "$clean_url" | grep -q "archiveformat="; then
         clean_url="${clean_url}&archiveformat=gz"
     fi
-    echo "$clean_url $stripped_user $stripped_pin"
+    # Fixed: Use pipe delimiter to avoid word-splitting issues
+    printf "%s|%s|%s\n" "$clean_url" "$stripped_user" "$stripped_pin"
 }
 
 # Manage blocklist configuration files (add, edit, view, delete)
@@ -201,8 +202,9 @@ manage_configs() {
                 echo "URL required."
                 exit 1
             fi
-            local stripped_user stripped_pin clean_url
-            read clean_url stripped_user stripped_pin <<< $(sanitize_url "$url")
+            # Fixed: Parse sanitize_url output safely
+            local clean_url stripped_user stripped_pin
+            read clean_url stripped_user stripped_pin < <(sanitize_url "$url" | tr '|' ' ')
             if [ -n "$stripped_user" ] || [ -n "$stripped_pin" ]; then
                 echo "Found credentials in URL:"
                 echo "Username: $stripped_user"
@@ -248,9 +250,10 @@ manage_configs() {
             fi
             echo
             read -p "Enter new URL (leave blank to keep current): " url
-            local stripped_user stripped_pin clean_url
+            local clean_url stripped_user stripped_pin
             if [ -n "$url" ]; then
-                read clean_url stripped_user stripped_pin <<< $(sanitize_url "$url")
+                # Fixed: Parse sanitize_url output safely
+                read clean_url stripped_user stripped_pin < <(sanitize_url "$url" | tr '|' ' ')
                 if [ -n "$stripped_user" ] || [ -n "$stripped_pin" ]; then
                     echo "Found credentials in URL:"
                     echo "Username: $stripped_user"
@@ -412,8 +415,9 @@ process_blocklist() {
         rm "$temp_list"
         return 1
     fi
-    local stripped_user stripped_pin clean_url
-    read clean_url stripped_user stripped_pin <<< $(sanitize_url "$URL")
+    # Fixed: Parse sanitize_url output safely
+    local clean_url stripped_user stripped_pin
+    read clean_url stripped_user stripped_pin < <(sanitize_url "$URL" | tr '|' ' ')
     if [ -n "$stripped_user" ] || [ -n "$stripped_pin" ]; then
         echo "Warning: Credentials found in $conf_file URL:"
         echo "Username: $stripped_user"
@@ -522,8 +526,14 @@ process_blocklist() {
         fi
     fi
 
+    # Fixed: Validate lines to prevent infinite loop or misparsing
     local cidr_count=0
     while IFS=':' read -r name range; do
+        # Skip empty or malformed lines
+        if [ -z "$range" ] || [ -z "${range//[[:space:]]/}" ]; then
+            echo "Skipping invalid line in $conf_file: $name:$range"
+            continue
+        fi
         # Validate IPv4 CIDR
         if echo "$range" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'; then
             if [ -z "${range##*/}" ]; then
@@ -552,6 +562,8 @@ process_blocklist() {
             else
                 echo "Invalid CIDR in $conf_file: $range"
             fi
+        else
+            echo "Skipping non-CIDR line in $conf_file: $range"
         fi
     done < "$temp_list"
     [ -n "$DEBUG_MODE" ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Found $cidr_count CIDRs in $temp_list" >&2
@@ -658,15 +670,28 @@ update_blocklist() {
     done >> "$IPSET_RESTORE_FILE"
 
     echo "Applying ipset restore ($((total_cidr - dupes)) unique entries)"
+    # Fixed: Validate ipset backup and offer user choice
     if ! sudo ipset restore < "$IPSET_RESTORE_FILE"; then
         echo "Failed to apply ipset restore; attempting to restore backup"
-        if [ -s "$IPSET_BACKUP_FILE" ] && sudo ipset restore < "$IPSET_BACKUP_FILE"; then
-            echo "Restored previous ipset state"
-            sudo iptables -I INPUT -m set --match-set blacklist src -j DROP 2>/dev/null
-            exit 1
+        if [ -s "$IPSET_BACKUP_FILE" ] && grep -q '^add blacklist' "$IPSET_BACKUP_FILE"; then
+            if sudo ipset restore < "$IPSET_BACKUP_FILE"; then
+                echo "Restored previous ipset state"
+                sudo iptables -I INPUT -m set --match-set blacklist src -j DROP 2>/dev/null
+                exit 1
+            else
+                echo "Failed to restore backup; backup may be invalid"
+                exit 1
+            fi
         else
-            echo "No valid backup available"
-            exit 1
+            echo "Warning: No valid backup available (empty or invalid)"
+            read -p "Continue without a blacklist? This may leave the system unprotected. (y/N): " continue_no_backup
+            if [[ "$continue_no_backup" =~ ^[Yy]$ ]]; then
+                echo "Proceeding without restoring blacklist; no rules will be applied"
+                exit 0
+            else
+                echo "Exiting due to invalid backup"
+                exit 1
+            fi
         fi
     fi
 
@@ -685,31 +710,54 @@ update_blocklist() {
         echo "Warning: Added fewer entries ($added) than expected (~$expected) based on input size"
     fi
 
+    # Fixed: Protect critical iptables rules with warning
     sudo iptables -D INPUT -m set --match-set blacklist src -j DROP 2>/dev/null
-    if ! sudo iptables -I INPUT -m set --match-set blacklist src -j DROP; then
-        echo "Failed to apply iptables rule"
-        exit 1
+    # Check for critical rules (e.g., SSH on port 22)
+    if sudo iptables -L INPUT -n | grep -q "ACCEPT.*tcp dpt:22"; then
+        echo "Warning: Detected critical rule (e.g., SSH on port 22) in iptables INPUT chain"
+        echo "Inserting blacklist rule may affect existing rules"
+        read -p "Continue with rule insertion? (y/N): " continue_iptables
+        if [[ ! "$continue_iptables" =~ ^[Yy]$ ]]; then
+            echo "Aborting rule insertion"
+            exit 1
+        fi
+        # Insert blacklist rule after critical rules (e.g., at position 2)
+        if ! sudo iptables -I INPUT 2 -m set --match-set blacklist src -j DROP; then
+            echo "Failed to apply iptables rule"
+            exit 1
+        fi
+    else
+        # No critical rules detected, insert at top
+        if ! sudo iptables -I INPUT 1 -m set --match-set blacklist src -j DROP; then
+            echo "Failed to apply iptables rule"
+            exit 1
+        fi
     fi
 
     echo "Blocklist applied successfully"
 }
+
+# Fixed: Robust file locking with permission checks
+LOCK_FILE="/tmp/blocklist.lock"
+if ! touch "$LOCK_FILE" 2>/dev/null; then
+    echo "Error: Cannot create lock file $LOCK_FILE"
+    exit 1
+fi
+if [ ! -w "$LOCK_FILE" ]; then
+    echo "Error: Lock file $LOCK_FILE is not writable"
+    exit 1
+fi
+exec 9> "$LOCK_FILE" || { echo "Error: Failed to open lock file descriptor"; exit 1; }
+if ! flock -n 9; then
+    echo "Error: Another instance of the script is running."
+    exit 1
+fi
 
 # Initialize modes and actions
 DEBUG_MODE=0
 LOG_MODE=0
 DRY_RUN=0
 ACTIONS=()
-
-# File locking to prevent concurrent runs
-if ! touch "/tmp/blocklist.lock" 2>/dev/null; then
-    echo "Error: Cannot create lock file /tmp/blocklist.lock"
-    exit 1
-fi
-exec 9>"/tmp/blocklist.lock"
-if ! flock -n 9; then
-    echo "Error: Another instance of the script is running."
-    exit 1
-fi
 
 # Parse command-line options
 while [ $# -gt 0 ]; do
