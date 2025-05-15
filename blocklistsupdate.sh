@@ -42,7 +42,7 @@
 # Most current version as of this edit: 4.6.4
 
 # Supports iptables/nftables, IPv4/IPv6, multiple blocklist sources, and configurable settings
-# Version 4.1: Enhanced sudo handling with re-launch option, improved root detection
+# Version 4.5: Added --clear-rules/--apply-rules for fast enable/disable of script-generated firewall rules, improved ipset reuse, generated help file, added runtime display
 
 # Inspired from https://lowendspirit.com/discussion/7699/use-a-blacklist-of-bad-ips-on-your-linux-firewall-tutorial
 # Credit to user itsdeadjim ( https://lowendspirit.com/profile/itsdeadjim )
@@ -105,8 +105,75 @@ EOF
     fi
 }
 
+# Generate blocklist_readme.md if it doesn't exist
+
+HELP_FILE="$HOME/blocklist_readme.md"
+if [ ! -f "$HELP_FILE" ]; then
+    # Generate help file
+    if ! touch "$HELP_FILE" 2>/dev/null; then
+        echo "Error: Cannot write to $HELP_FILE"
+        exit 1
+    fi
+    cat > "$HELP_FILE" << 'EOF'
+# Blocklist Update Script
+Manages IPv4/IPv6 blocklists for Linux firewalls using iptables/ipset or nftables.
+
+## Features
+- Downloads and merges blocklists from multiple sources with validation and deduplication.
+- Supports iptables/ipset and nftables backends for flexible firewall integration.
+- Configurable via `~/.blocklist.conf` and per-source `~/.blocklists/*.conf`.
+- Fast rule toggling with `--clear-rules` and `--apply-rules` (reuses ipsets for instant application).
+- Credential management for authenticated blocklists (`--auth`).
+- Progress bars with `pv`, syntax checks, and detailed debugging (`--debug`, `--verbosedebug`).
+- Non-interactive mode and cron support for automation.
+- Robust IPv4/IPv6 CIDR merging, with optional `aggregate`/`aggregate6` for speed.
+
+## Installation
+On a Debian-based system, install dependencies and prepare the script:
+
+```bash
+sudo apt-get install wget gunzip awk iptables ipset
+# Optional for progress bars and faster merging
+sudo apt-get install pv aggregate aggregate6
+chmod +x blocklistsupdatev2.sh
+```
+
+Notes:
+- Replace iptables ipset with nftables if using --backend nftables.
+
+- pv enables progress bars; aggregate/aggregate6 speed up merging for large blocklists (>10,000 CIDRs).
+
+- Place the script (or create a symlink with `ln -s TARGET LINK_NAME`) in /usr/local/bin/ for system-wide access (optional).
+
+## Usage
+1. Configure blocklist sources:
+`./blocklistsupdatev2.sh --config`
+1. Update and apply blocklists:
+`./blocklistsupdatev2.sh`
+1. Toggle rules without rebuilding ipsets:
+`./blocklistsupdatev2.sh --clear-rules`
+`./blocklistsupdatev2.sh --apply-rules`
+1. View full options:
+`./blocklistsupdatev2.sh --help`
+
+## Configuration
+- Edit `~/.blocklist.conf` for defaults (e.g., `CONFIG_DIR`, `IPSET_NAME`).
+
+- Add blocklist sources in `~/.blocklists/*.conf` with `URL` and (if needed) `USERNAME`, `PIN`.
+
+- Use `--auth` to manage credentials for authenticated sources.
+EOF
+fi
+
+# Check start time for run time calculation
+START_TIME=$(date +%s)
+
 # Create secure temporary files
 setup_temp_files() {
+    if ! [ -w /tmp ]; then
+    echo "Error: /tmp is not writable"
+    exit 1
+    fi
     IP_LIST_RAW=$(mktemp /tmp/iplist_raw.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
     IP_LIST=$(mktemp /tmp/iplist.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
     IPSET_BACKUP_FILE=$(mktemp /tmp/ipset_backup.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
@@ -118,26 +185,35 @@ cleanup() {
     rm -f "$IP_LIST_RAW" "$IP_LIST" "$IPSET_RESTORE_FILE" "$IPSET_BACKUP_FILE" /tmp/iplist_*.txt /tmp/ipset_commands.* /tmp/cidr_list.* /tmp/aggregated_cidr_list.* /tmp/wget_output /tmp/pv_output
     [ "$DEBUG_MODE" -eq 1 ] && echo "Script exited at: $(date)"
 }
-trap cleanup EXIT
 
 # Display usage information
 show_help() {
+    echo "Blocklist management script for Linux firewalls (iptables/nftables, IPv4/IPv6)"
     echo "Usage: $0 [OPTIONS]"
     echo "Options:"
     echo "  --help        Display this help message"
     echo "  --config      Manage blocklist config files (add, edit, delete, view)"
     echo "  --auth        Edit or clear credentials"
-    echo "  --purge       Remove blocklist rules, ipset, and optionally configs"
-    echo "  --debug       Enable high-level debug output"
-    echo "  --verbosedebug Enable detailed debug output (full tracing)"
+    echo "  --purge       Remove blocklist rules and ipsets; optionally delete configs"
+    echo "  --clear-rules Remove blocklist rules, keeping ipsets for fast reapplication"
+    echo "  --apply-rules Re-apply blocklist rules from configs"
+    echo "  --debug       Enable debug output (includes syntax check)"
+    echo "  --verbosedebug Enables --debug, and adds full tracing"
     echo "  --log         Log output to $LOG_FILE"
     echo "  --dry-run     Simulate blocklist update without changes"
     echo "  --ipv6        Process IPv6 addresses (default: IPv4 only)"
-    echo "  --no-ipv4-merge  Disable IPv4 CIDR merging to avoid slow Bash processing, risking overlaps"
-    echo "  --no-ipv6-merge  Disable IPv6 CIDR merging to avoid slow Bash processing, risking overlaps"
+    echo "  --no-ipv4-merge  Disable IPv4 CIDR merging (faster, risks overlaps)"
+    echo "  --no-ipv6-merge  Disable IPv6 CIDR merging (faster, risks overlaps)"
     echo "  --backend     Set firewall backend (iptables/nftables, default: $FIREWALL_BACKEND)"
     echo "  --non-interactive  Suppress prompts, use config defaults"
-    echo "  --ipset-test  Enable ipset test to skip duplicates (may add ~5-10 seconds for 1,500 duplicates)"
+    echo "  --ipset-test  Check for duplicates in ipset (adds ~5-10 seconds for 1,500 duplicates)"
+    echo "Requirements:"
+    echo "  - Required: wget, gunzip, awk, and either (iptables and ipset) or nftables"
+    echo "  - Recommended: pv (progress bars), aggregate/aggregate6 (faster merging)"
+    echo "Notes:"
+    echo "  - Configs stored in $CONFIG_DIR/*.conf"
+    echo "  - Large blocklists (>10,000 CIDRs) may be slow without aggregate"
+    echo "  - Use --no-ipv4-merge/--no-ipv6-merge for speed if overlaps are acceptable"
 }
 
 # Check for required dependencies
@@ -147,6 +223,10 @@ check_dependencies() {
         cmds="$cmds iptables ipset"
     elif [ "$FIREWALL_BACKEND" = "nftables" ]; then
         cmds="$cmds nft"
+    fi
+    if ! command -v sudo >/dev/null; then
+        echo "Error: 'sudo' command not found"
+        exit 1
     fi
     for cmd in $cmds; do
         if ! command -v "$cmd" >/dev/null; then
@@ -220,6 +300,11 @@ setup_config_dir() {
     elif [ ! -w "$CONFIG_DIR" ]; then
         echo "Warning: $CONFIG_DIR is not writable"
     fi
+        for conf_file in "$CONFIG_DIR"/*.conf; do
+        if [ -f "$conf_file" ] && ! grep -q '^URL=' "$conf_file"; then
+            echo "Warning: $conf_file missing URL; it will be skipped"
+        fi
+    done
 }
 
 # Manage credentials
@@ -250,6 +335,10 @@ manage_credentials() {
                 echo "Credentials cleared"
             fi
         else
+            if ! touch "$CRED_FILE" 2>/dev/null; then
+                echo "Error: Cannot write to $CRED_FILE"
+                exit 1
+            fi
             echo "USERNAME=$username" > "$CRED_FILE"
             echo "PIN=$pin" >> "$CRED_FILE"
             chmod 600 "$CRED_FILE"
@@ -405,7 +494,7 @@ manage_configs() {
 # Purge blocklist setup
 purge_blocklist() {
     check_sudo
-    echo "Purging blocklist setup..."
+    echo "Removing blocklist rules and ipsets..."
     if [ "$FIREWALL_BACKEND" = "iptables" ]; then
         sudo iptables -D "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null
         [ "$IPV6_ENABLED" -eq 1 ] && sudo ip6tables -D "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>/dev/null
@@ -417,19 +506,41 @@ purge_blocklist() {
         sudo nft delete set ip filter "$IPSET_NAME" 2>/dev/null
         [ "$IPV6_ENABLED" -eq 1 ] && sudo nft delete set ip6 filter "${IPSET_NAME}_v6" 2>/dev/null
     fi
-    echo "Rules and sets removed"
-    read -p "Delete configs and credentials? (y/N): " delete_all
-    if [[ "$delete_all" =~ ^[Yy]$ ]]; then
-        [ -f "$CRED_FILE" ] && { [ -w "$CRED_FILE" ] && rm "$CRED_FILE" || sudo rm "$CRED_FILE"; echo "Credentials deleted"; }
-        if [ -d "$CONFIG_DIR" ]; then
-            for conf_file in "$CONFIG_DIR"/*.conf; do
-                [ -f "$conf_file" ] && { [ -w "$conf_file" ] && rm "$conf_file" || sudo rm "$conf_file"; }
-            done
-            rmdir "$CONFIG_DIR"
-            echo "Configs deleted"
+    if [ "$NON_INTERACTIVE" -eq 0 ]; then
+        echo "Blocklist rules and ipsets removed; configs and credentials preserved by default."
+        read -p "Also delete configs and credentials in $CONFIG_DIR? (y/N): " delete_configs
+        if [[ "$delete_configs" =~ ^[Yy]$ ]]; then
+            rm -rf "$CONFIG_DIR" "$CRED_FILE"
+            echo "Configs and credentials deleted"
+        else
+            echo "Configs and credentials kept"
+        fi
+    else
+        echo "Non-interactive mode: Configs and credentials preserved"
+    fi
+    echo "Blocklist purge complete"
+}
+
+# Clear blocklist rules from firewall
+clear_rules() {
+    check_sudo
+    if [ "$NON_INTERACTIVE" -eq 0 ]; then
+        echo "This will remove blocklist firewall rules, keeping ipsets and configs for fast reapplication."
+        read -p "Continue? (y/N): " confirm_clear
+        if [[ ! "$confirm_clear" =~ ^[Yy]$ ]]; then
+            echo "Clearing aborted"
+            return 0
         fi
     fi
-    echo "Purge complete"
+    echo "Clearing blocklist firewall rules..."
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        sudo iptables -D "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null
+        [ "$IPV6_ENABLED" -eq 1 ] && sudo ip6tables -D "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>/dev/null
+    else
+        sudo nft delete rule ip filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip filter "$IPTABLES_CHAIN" | grep "set $IPSET_NAME" | awk '{print $NF}') 2>/dev/null
+        [ "$IPV6_ENABLED" -eq 1 ] && sudo nft delete rule ip6 filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip6 filter "$IPTABLES_CHAIN" | grep "set ${IPSET_NAME}_v6" | awk '{print $NF}') 2>/dev/null
+    fi
+    echo "Blocklist firewall rules cleared; ipsets preserved for fast reapplication"
 }
 
 # Load credentials
@@ -473,7 +584,7 @@ download_blocklist() {
     # Attempt download with retries
     for attempt in $(seq 1 "$RETRY_ATTEMPTS"); do
         [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Attempt $attempt: wget $fetch_url" >&2
-        local wget_cmd="wget -nv --timeout=10 --tries=1 -O - $fetch_url"
+        local wget_cmd="wget -nv --location --timeout=10 --tries=1 -O - $fetch_url"
         if command -v pv >/dev/null; then
             # Use pv to show download progress
             if $wget_cmd 2>/tmp/wget_output | pv -f -N "Downloading $fetch_url" > "$temp_raw" 2>/tmp/pv_output; then
@@ -487,13 +598,13 @@ download_blocklist() {
         fi
         local wget_error=$(cat /tmp/wget_output)
         if echo "$wget_error" | grep -q "403 Forbidden"; then
-            echo "Authentication failed for $fetch_url"
+            echo "Authentication failed for $fetch_url" | tee -a "$LOG_FILE"
             rm -f /tmp/wget_output /tmp/pv_output
             return 1
         elif echo "$wget_error" | grep -q "429 Too Many Requests"; then
-            echo "Rate limit exceeded for $fetch_url"
+            echo "Rate limit exceeded for $fetch_url" | tee -a "$LOG_FILE"
         else
-            echo "Download attempt $attempt failed: $wget_error"
+            echo "Download attempt $attempt failed: $wget_error" | tee -a "$LOG_FILE"
         fi
         [ "$attempt" -lt "$RETRY_ATTEMPTS" ] && { echo "Retrying in $RETRY_DELAY seconds..."; sleep "$RETRY_DELAY"; }
     done
@@ -1022,6 +1133,16 @@ update_blocklist() {
 
     : > "$IP_LIST"
     local total_cidr=0
+    if [ -s "$IP_LIST" ]; then
+        total_cidr=$(wc -l < "$IP_LIST")
+        if [ "$total_cidr" -gt 100000 ]; then
+            echo "Warning: $total_cidr CIDRs detected across all blocklists; processing may take significant time."
+            if [ "$NON_INTERACTIVE" -eq 0 ]; then
+                read -p "Continue? (y/N): " continue_large
+                [[ ! "$continue_large" =~ ^[Yy]$ ]] && { echo "Aborted"; exit 0; }
+            fi
+        fi
+    fi
     for conf_file in "$CONFIG_DIR"/*.conf; do
         if [ -f "$conf_file" ]; then
             echo "Processing $conf_file... (at $(date))"
@@ -1102,181 +1223,186 @@ update_blocklist() {
         : > "$AGGREGATED_CIDR_LIST_V6"
     fi
 
-    # Clean up existing rules
-    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
-        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Removing existing iptables rules" >&2
-        sudo iptables -D "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null
-        [ "$IPV6_ENABLED" -eq 1 ] && sudo ip6tables -D "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>/dev/null
-    else
-        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Removing existing nft rules" >&2
-        sudo nft delete rule ip filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip filter "$IPTABLES_CHAIN" | grep "set $IPSET_NAME" | awk '{print $NF}') 2>/dev/null
-        [ "$IPV6_ENABLED" -eq 1 ] && sudo nft delete rule ip6 filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip6 filter "$IPTABLES_CHAIN" | grep "set ${IPSET_NAME}_v6" | awk '{print $NF}') 2>/dev/null
-    fi
-
-    # Backup and destroy sets
-    backup_set "$IPSET_NAME"
-    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
-        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Destroying ipset $IPSET_NAME" >&2
-        sudo ipset destroy "$IPSET_NAME" 2>/dev/null
-        [ "$IPV6_ENABLED" -eq 1 ] && {
-            backup_set "${IPSET_NAME}_v6"
-            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Destroying ipset ${IPSET_NAME}_v6" >&2
-            sudo ipset destroy "${IPSET_NAME}_v6" 2>/dev/null
-        }
-    else
-        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting nft set $IPSET_NAME" >&2
-        sudo nft delete set ip filter "$IPSET_NAME" 2>/dev/null
-        [ "$IPV6_ENABLED" -eq 1 ] && {
-            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting nft set ${IPSET_NAME}_v6" >&2
-            sudo nft delete set ip6 filter "${IPSET_NAME}_v6" 2>/dev/null
-        }
-    fi
-
     # Calculate total unique CIDRs after aggregation
     num_ipv4_cidrs=$(wc -l < "$AGGREGATED_CIDR_LIST")
     num_ipv6_cidrs=$(wc -l < "$AGGREGATED_CIDR_LIST_V6")
     num_cidrs=$((num_ipv4_cidrs + num_ipv6_cidrs))
     echo "Total unique CIDRs: $num_cidrs" >&2
-    
-    # Calculate hashsize (next power of 2 greater than 1.5 * num_cidrs) and maxelem
-    hashsize=$(awk -v n="$num_cidrs" 'BEGIN { n = n * 1.5; logval = log(n)/log(2); print 2^int(logval+1) }')
-    maxelem=$((num_cidrs * 2))
-    [ $hashsize -lt 1024 ] && hashsize=1024
-    [ $maxelem -lt 1024 ] && maxelem=1024
-    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Calculated hashsize=$hashsize, maxelem=$maxelem" >&2
-    
-    # Create sets with hash:net
-    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Creating ipset $IPSET_NAME with hashsize $hashsize" >&2
-    sudo ipset create "$IPSET_NAME" hash:net hashsize "$hashsize" family inet maxelem "$maxelem" 2>/dev/null
-    [ "$IPV6_ENABLED" -eq 1 ] && {
-        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Creating ipset ${IPSET_NAME}_v6 with hashsize $hashsize" >&2
-        sudo ipset create "${IPSET_NAME}_v6" hash:net hashsize "$hashsize" family inet6 maxelem "$maxelem" 2>/dev/null
-    }
-    
-    # Populate sets
-    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Populating ipset $IPSET_NAME" >&2
-    TMP_SCRIPT=$(mktemp /tmp/ipset_commands.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
-    chmod 600 "$TMP_SCRIPT"
-    echo "flush $IPSET_NAME" > "$TMP_SCRIPT"
-    [ "$IPV6_ENABLED" -eq 1 ] && echo "flush ${IPSET_NAME}_v6" >> "$TMP_SCRIPT"
-    cidr_count=0
-    
-    # Add aggregated CIDRs to ipset commands with pv progress
-    if command -v pv >/dev/null; then
-        # IPv4 CIDRs
-        if [ -s "$AGGREGATED_CIDR_LIST" ]; then
-            pv -f -N "Applying IPv4 CIDRs to $IPSET_NAME" -s "$num_ipv4_cidrs" "$AGGREGATED_CIDR_LIST" | while IFS= read -r cidr; do
-                [ -z "$cidr" ] && continue
-                if [ "$IPSET_TEST" -eq 1 ] && sudo ipset test "$IPSET_NAME" "$cidr" 2>/dev/null; then
-                    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping duplicate IPv4 CIDR $cidr in $IPSET_NAME" >&2
-                else
-                    add_to_set inet "$cidr" "$IPSET_NAME"
-                fi
-                ((cidr_count++))
-            done >> "$TMP_SCRIPT"
-        fi
-        # IPv6 CIDRs
-        if [ "$IPV6_ENABLED" -eq 1 ] && [ -s "$AGGREGATED_CIDR_LIST_V6" ]; then
-            pv -f -N "Applying IPv6 CIDRs to ${IPSET_NAME}_v6" -s "$num_ipv6_cidrs" "$AGGREGATED_CIDR_LIST_V6" | while IFS= read -r cidr; do
-                [ -z "$cidr" ] && continue
-                if [ "$IPSET_TEST" -eq 1 ] && sudo ipset test "${IPSET_NAME}_v6" "$cidr" 2>/dev/null; then
-                    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping duplicate IPv6 CIDR $cidr in ${IPSET_NAME}_v6" >&2
-                else
-                    add_to_set inet6 "$cidr" "${IPSET_NAME}_v6"
-                fi
-                ((cidr_count++))
-            done >> "$TMP_SCRIPT"
-        fi
+
+    # Apply CIDRs to ipsets
+    if [ -s "$AGGREGATED_CIDR_LIST" ]; then
+        echo "Applying $num_ipv4_cidrs IPv4 CIDRs to $IPSET_NAME"
+        apply_ipset inet "$IPSET_NAME" "$AGGREGATED_CIDR_LIST" "$num_ipv4_cidrs"
     else
-        # Fallback without pv
-        while IFS= read -r cidr; do
-            [ -z "$cidr" ] && continue
-            if [ "$IPSET_TEST" -eq 1 ] && sudo ipset test "$IPSET_NAME" "$cidr" 2>/dev/null; then
-                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping duplicate IPv4 CIDR $cidr in $IPSET_NAME" >&2
-            else
-                add_to_set inet "$cidr" "$IPSET_NAME"
-            fi
-            ((cidr_count++))
-        done < "$AGGREGATED_CIDR_LIST" >> "$TMP_SCRIPT"
-        if [ "$IPV6_ENABLED" -eq 1 ]; then
-            while IFS= read -r cidr; do
-                [ -z "$cidr" ] && continue
-                if [ "$IPSET_TEST" -eq 1 ] && sudo ipset test "${IPSET_NAME}_v6" "$cidr" 2>/dev/null; then
-                    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping duplicate IPv6 CIDR $cidr in ${IPSET_NAME}_v6" >&2
-                else
-                    add_to_set inet6 "$cidr" "${IPSET_NAME}_v6"
-                fi
-                ((cidr_count++))
-            done < "$AGGREGATED_CIDR_LIST_V6" >> "$TMP_SCRIPT"
-        fi
+        echo "No IPv4 CIDRs to apply"
+        num_ipv4_cidrs=0
+    fi
+    if [ "$IPV6_ENABLED" -eq 1 ] && [ -s "$AGGREGATED_CIDR_LIST_V6" ]; then
+        echo "Applying $num_ipv6_cidrs IPv6 CIDRs to ${IPSET_NAME}_v6"
+        apply_ipset inet6 "${IPSET_NAME}_v6" "$AGGREGATED_CIDR_LIST_V6" "$num_ipv6_cidrs"
+    else
+        [ "$IPV6_ENABLED" -eq 1 ] && echo "No IPv6 CIDRs to apply"
+        num_ipv6_cidrs=0
     fi
 
-    # Apply sets with fallback
-    echo "Applying $((total_cidr - dupes)) unique entries"
-    ipset_output=$(sudo ipset restore < "$TMP_SCRIPT" 2>&1)
-    ipset_status=$?
-    if [ $ipset_status -ne 0 ]; then
-        echo "Failed to apply set: $ipset_output" | tee -a "$LOG_FILE"
-        echo "Failed to apply set; attempting fallback..."
-        # Split commands into chunks with dynamic sizing
-        chunk_size=100000
-        attempts=0
-        max_attempts=3
-        while [ $ipset_status -ne 0 ] && [ $attempts -lt $max_attempts ]; do
-            echo "Failed to apply set; attempting fallback with chunk size $chunk_size..." | tee -a "$LOG_FILE"
-            split -l "$chunk_size" "$TMP_SCRIPT" ipset_chunk_
-            sudo ipset destroy "$IPSET_NAME" 2>/dev/null
-            [ "$IPV6_ENABLED" -eq 1 ] && sudo ipset destroy "${IPSET_NAME}_v6" 2>/dev/null
-            sudo ipset create "$IPSET_NAME" hash:net hashsize "$hashsize" family inet maxelem "$maxelem" 2>/dev/null
-            [ "$IPV6_ENABLED" -eq 1 ] && sudo ipset create "${IPSET_NAME}_v6" hash:net hashsize "$hashsize" family inet6 maxelem "$maxelem" 2>/dev/null
-            for chunk in ipset_chunk_*; do
-                ipset_output=$(sudo ipset restore < "$chunk" 2>&1)
-                ipset_status=$?
-                if [ $ipset_status -ne 0 ]; then
-                    echo "Failed to apply chunk $chunk: $ipset_output" | tee -a "$LOG_FILE"
-                    break
+    # Function to apply CIDRs to ipset or nftables set
+    apply_ipset() {
+        local family="$1" set_name="$2" ipset_file="$3" expected_count="$4"
+        local tmp_script
+        tmp_script=$(mktemp /tmp/ipset_commands.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
+        chmod 600 "$tmp_script"
+
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "Dry run: Would apply $set_name from $ipset_file ($expected_count entries)"
+            rm -f "$tmp_script"
+            return 0
+        fi
+
+        check_sudo
+
+        if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+            # Check if ipset exists and is non-empty
+            if sudo ipset list "$set_name" >/dev/null 2>&1 && [ "$(sudo ipset list "$set_name" | grep -c 'Number of entries')" -gt 0 ]; then
+                echo "Reusing existing ipset $set_name"
+                # Reapply rule if missing
+                if ! sudo iptables -C "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP 2>/dev/null; then
+                    sudo iptables -I "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP
+                    echo "Reapplied firewall rule for $set_name"
                 fi
+                [ "$family" = "inet6" ] && ! sudo ip6tables -C "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP 2>/dev/null && sudo ip6tables -I "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP
+                rm -f "$tmp_script"
+                return 0
+            fi
+
+            # Calculate hashsize and maxelem
+            local hashsize maxelem
+            hashsize=$(awk -v n="$expected_count" 'BEGIN { n = n * 1.5; logval = log(n)/log(2); print 2^int(logval+1) }')
+            maxelem=$((expected_count * 2))
+            [ $hashsize -lt 1024 ] && hashsize=1024
+            [ $maxelem -lt 1024 ] && maxelem=1024
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Calculated hashsize=$hashsize, maxelem=$maxelem for $set_name" >&2
+
+            # Create new ipset
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Creating ipset $set_name with hashsize $hashsize" >&2
+            sudo ipset create "$set_name" hash:net hashsize "$hashsize" family "$family" maxelem "$maxelem" 2>/dev/null || {
+                echo "Error: Failed to create ipset $set_name"
+                rm -f "$tmp_script"
+                exit 1
+            }
+
+            # Populate ipset
+            echo "flush $set_name" > "$tmp_script"
+            local cidr_count=0
+            if command -v pv >/dev/null; then
+                pv -f -N "Applying $family CIDRs to $set_name" -s "$expected_count" "$ipset_file" | while IFS= read -r cidr; do
+                    [ -z "$cidr" ] && continue
+                    if [ "$IPSET_TEST" -eq 1 ] && sudo ipset test "$set_name" "$cidr" 2>/dev/null; then
+                        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping duplicate $family CIDR $cidr in $set_name" >&2
+                    else
+                        echo "add $set_name $cidr" >> "$tmp_script"
+                    fi
+                    ((cidr_count++))
+                done
+            else
+                while IFS= read -r cidr; do
+                    [ -z "$cidr" ] && continue
+                    if [ "$IPSET_TEST" -eq 1 ] && sudo ipset test "$set_name" "$cidr" 2>/dev/null; then
+                        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping duplicate $family CIDR $cidr in $set_name" >&2
+                    else
+                        echo "add $set_name $cidr" >> "$tmp_script"
+                    fi
+                    ((cidr_count++))
+                done < "$ipset_file"
+            fi
+
+            # Apply ipset commands with chunking fallback
+            local ipset_output ipset_status chunk_size=100000 attempts=0 max_attempts=3
+            ipset_output=$(sudo ipset restore < "$tmp_script" 2>&1)
+            ipset_status=$?
+            while [ $ipset_status -ne 0 ] && [ $attempts -lt $max_attempts ]; do
+                echo "Failed to apply ipset $set_name: $ipset_output" | tee -a "$LOG_FILE"
+                echo "Attempting fallback with chunk size $chunk_size..." | tee -a "$LOG_FILE"
+                split -l "$chunk_size" "$tmp_script" ipset_chunk_
+                sudo ipset destroy "$set_name" 2>/dev/null
+                sudo ipset create "$set_name" hash:net hashsize "$hashsize" family "$family" maxelem "$maxelem" 2>/dev/null
+                for chunk in ipset_chunk_*; do
+                    ipset_output=$(sudo ipset restore < "$chunk" 2>&1)
+                    ipset_status=$?
+                    if [ $ipset_status -ne 0 ]; then
+                        echo "Failed to apply chunk $chunk: $ipset_output" | tee -a "$LOG_FILE"
+                        break
+                    fi
+                done
+                rm -f ipset_chunk_*
+                attempts=$((attempts + 1))
+                chunk_size=$((chunk_size / 2))
+                [ $chunk_size -lt 1000 ] && chunk_size=1000
             done
-            rm ipset_chunk_*
-            attempts=$((attempts + 1))
-            chunk_size=$((chunk_size / 2))
-            [ $chunk_size -lt 1000 ] && chunk_size=1000
-        done
-        if [ $ipset_status -ne 0 ]; then
-            echo "Failed to apply set after $max_attempts attempts; restoring backup..." | tee -a "$LOG_FILE"
-            if [ -s "$IPSET_BACKUP_FILE" ]; then
-                if sudo ipset restore < "$IPSET_BACKUP_FILE" 2>/dev/null; then
-                    echo "Restored previous state"
-                    apply_rule inet "$IPSET_NAME"
-                    [ "$IPV6_ENABLED" -eq 1 ] && apply_rule inet6 "${IPSET_NAME}_v6"
-                    rm "$TMP_SCRIPT"
-                    exit 1
-                else
-                    echo "Failed to restore backup" | tee -a "$LOG_FILE"
+            if [ $ipset_status -ne 0 ]; then
+                echo "Failed to apply ipset $set_name after $max_attempts attempts" | tee -a "$LOG_FILE"
+                if [ -s "$IPSET_BACKUP_FILE" ]; then
+                    if sudo ipset restore < "$IPSET_BACKUP_FILE" 2>/dev/null; then
+                        echo "Restored previous state"
+                        apply_rule "$family" "$set_name"
+                    else
+                        echo "Failed to restore backup" | tee -a "$LOG_FILE"
+                    fi
                 fi
+                rm -f "$tmp_script"
+                exit 1
             fi
-            if [ "$NON_INTERACTIVE" -eq 1 ]; then
-                [ "$NON_INTERACTIVE_CONTINUE_NO_BACKUP" = "y" ] && { echo "Proceeding without blacklist"; rm "$TMP_SCRIPT"; exit 0; }
-            else
-                read -p "Exit without applying blacklist? (y/N): " continue_no_backup
-                [[ "$continue_no_backup" =~ ^[Yy]$ ]] && { echo "Proceeding without blacklist"; rm "$TMP_SCRIPT"; exit 0; }
+            echo "Applied $cidr_count entries to $set_name"
+        else
+            # Nftables
+            if sudo nft list set ip filter "$set_name" >/dev/null 2>&1 || sudo nft list set ip6 filter "$set_name" >/dev/null 2>&1; then
+                echo "Reusing existing nftables set $set_name"
+                if ! sudo nft list chain ip filter "$IPTABLES_CHAIN" | grep -q "set $set_name"; then
+                    sudo nft add rule ip filter "$IPTABLES_CHAIN" ip saddr "@$set_name" drop
+                    echo "Reapplied firewall rule for $set_name (IPv4)"
+                fi
+                [ "$family" = "inet6" ] && ! sudo nft list chain ip6 filter "$IPTABLES_CHAIN" | grep -q "set $set_name" && sudo nft add rule ip6 filter "$IPTABLES_CHAIN" ip6 saddr "@$set_name" drop && echo "Reapplied firewall rule for $set_name (IPv6)"
+                rm -f "$tmp_script"
+                return 0
             fi
-            rm "$TMP_SCRIPT"
-            exit 1
-        fi
-    else
-        if [ "$DEBUG_MODE" -eq 1 ]; then
-            script_name=$(basename "$0" .sh)
-            ipset_log="${script_name}_ipset.log"
-            if [ -f "$ipset_log" ]; then
-                rm "$ipset_log"
-                echo "DEBUG: ipset completed without errors in this run; erasing diagnostic log from previous error" >&2
-            fi
-        fi
-    fi
-    rm "$TMP_SCRIPT"
 
-    # Verify
+            # Create new nftables set
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Creating nftables set $set_name" >&2
+            if [ "$family" = "inet" ]; then
+                sudo nft add set ip filter "$set_name" "{ type ipv4_addr; flags interval; }" 2>/dev/null
+            else
+                sudo nft add set ip6 filter "$set_name" "{ type ipv6_addr; flags interval; }" 2>/dev/null
+            fi
+
+            # Populate nftables set
+            local cidr_count=0
+            if command -v pv >/dev/null; then
+                pv -f -N "Applying $family CIDRs to $set_name" -s "$expected_count" "$ipset_file" | while IFS= read -r cidr; do
+                    [ -z "$cidr" ] && continue
+                    sudo nft add element ip filter "$set_name" "{ $cidr }" 2>/dev/null || sudo nft add element ip6 filter "$set_name" "{ $cidr }" 2>/dev/null
+                    ((cidr_count++))
+                done
+            else
+                while IFS= read -r cidr; do
+                    [ -z "$cidr" ] && continue
+                    sudo nft add element ip filter "$set_name" "{ $cidr }" 2>/dev/null || sudo nft add element ip6 filter "$set_name" "{ $cidr }" 2>/dev/null
+                    ((cidr_count++))
+                done < "$ipset_file"
+            fi
+            echo "Applied $cidr_count entries to $set_name"
+        fi
+        rm -f "$tmp_script"
+    }
+
+    # Clean up temporary files
+    rm -f "$IP_LIST" "$AGGREGATED_CIDR_LIST" "$AGGREGATED_CIDR_LIST_V6"
+
+    # Backup ipset
+    if [ "$DRY_RUN" -eq 0 ]; then
+        backup_set "$IPSET_NAME"
+        [ "$IPV6_ENABLED" -eq 1 ] && backup_set "${IPSET_NAME}_v6"
+    fi
+
+    # Verify entries
     local added=0
     if [ "$FIREWALL_BACKEND" = "iptables" ]; then
         [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Verifying ipset $IPSET_NAME entries" >&2
@@ -1294,7 +1420,7 @@ update_blocklist() {
         }
     fi
     echo "Added $added entries"
-    [ "$added" -lt $((total_cidr / 2)) ] && echo "Warning: Fewer entries than expected"
+    [ "$added" -lt $((num_cidrs / 2)) ] && echo "Warning: Fewer entries than expected"
 
     # Check for critical rules (e.g., SSH)
     local rule_pos=1
@@ -1307,11 +1433,6 @@ update_blocklist() {
             [[ "$continue_iptables" =~ ^[Yy]$ ]] && rule_pos=2
         fi
     fi
-
-    # Apply rules
-    apply_rule inet "$IPSET_NAME"
-    [ "$IPV6_ENABLED" -eq 1 ] && apply_rule inet6 "${IPSET_NAME}_v6"
-    echo "Blocklist applied successfully"
 }
 
 # Main script (Modified: Added stale lock directory cleanup)
@@ -1325,7 +1446,8 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     echo "Error: Another instance is running or lock directory creation failed"
     exit 1
 fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null; cleanup' EXIT
+
+trap 'rmdir "$LOCK_DIR" 2>/dev/null; cleanup' EXIT INT TERM
 
 # Initialize modes
 load_config
@@ -1350,6 +1472,8 @@ while [ $# -gt 0 ]; do
         --config) ACTIONS+=("config");;
         --auth) ACTIONS+=("auth");;
         --purge) ACTIONS+=("purge");;
+        --clear-rules) ACTIONS+=("clear_rules");;
+        --apply-rules) ACTIONS+=("apply_rules");;
         --debug) DEBUG_MODE=1;;
         --verbosedebug) DEBUG_MODE=1; VERBOSE_DEBUG=1;;
         --log) LOG_MODE=1;;
@@ -1416,9 +1540,14 @@ for action in "${ACTIONS[@]}"; do
         config) manage_configs;;
         auth) manage_credentials;;
         purge) purge_blocklist;;
-        update) load_credentials; update_blocklist "$DRY_RUN";;
+        clear_rules) clear_rules;;
+        apply_rules|update) load_credentials; update_blocklist "$DRY_RUN";;
     esac
 done
 
-# Display completion time
-echo "Script completed at: $(date)"
+# Display completion time and script run time
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+ELAPSED_MIN=$((ELAPSED / 60))
+ELAPSED_SEC=$((ELAPSED % 60))
+echo "Script completed at: $(date) (Elapsed: ${ELAPSED_MIN}m ${ELAPSED_SEC}s)"
