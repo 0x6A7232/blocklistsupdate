@@ -39,10 +39,10 @@
 # Use it wisely, and don’t blame me if your iptables start a revolution. 😜
 # https://x.com/i/grok/share/K4qGv45jBDxgFgouZwGI3uPk6 
 
-# Most current version as of this edit: 4.6.4
+# Most current version as of this edit: 4.6.5
 
 # Supports iptables/nftables, IPv4/IPv6, multiple blocklist sources, and configurable settings
-# Version 4.6.4: Added --purge-all option to remove all rules, ipsets, configs, and credentials; added --update-readme to update README file; added --update-configfile to manage config file updates with backup; improved iptables/ip6tables chain verification and creation; enhanced logging with backup and warnings; improved debug output for rule and set deletion; enforced stricter argument validation for --purge and --purge-all; updated README generation to reflect new features.
+# Version 4.6.5: Added --status option to display current ipset/nftables sets, iptables/ip6tables/nftables rules, and count of blocked IPs with sample entries; improved user feedback for monitoring firewall state; fixed redundant mv error in IPv4 and IPv6 aggregation blocks to ensure robust file handling with single or multiple blocklists.
 
 # Inspired from https://lowendspirit.com/discussion/7699/use-a-blacklist-of-bad-ips-on-your-linux-firewall-tutorial
 # Credit to user itsdeadjim ( https://lowendspirit.com/profile/itsdeadjim )
@@ -248,9 +248,12 @@ Notes:
 ./blocklistsupdate.sh --apply-rules
 4. Purge all data (add -y to purge immediately without prompting):
 ./blocklistsupdate.sh --purge-all
-5. Update README:
+5. Check current blocklist status (sets, rules, and entry counts):
+./blocklistsupdate.sh --status
+   - Shows up to 5 sample IPs/CIDRs per set, total entries, and firewall backend.
+6. Update README:
 ./blocklistsupdate.sh --update-readme
-6. View full options:
+7. View full options:
 ./blocklistsupdate.sh --help
 
 ## Configuration
@@ -340,6 +343,7 @@ show_help() {
     echo "  --backend=iptables|nftables  Set firewall backend (default: $FIREWALL_BACKEND)"
     echo "  --non-interactive  Run without user prompts, using config defaults"
     echo "  --ipset-test      Check for duplicates in ipset (adds ~5-10 seconds for 1,500 duplicates)"
+    echo "  --status          Display current ipset/nftables sets and iptables/nftables rules with entry counts"
     echo "Requirements:"
     echo "  - Required: wget, gunzip, awk, and either (iptables and ipset) or nftables"
     echo "  - Recommended: pv (progress bars), aggregate/aggregate6 (faster merging)"
@@ -1705,15 +1709,15 @@ update_blocklist() {
     fi
     # IPv4 aggregation
     if [ "$NO_IPV4_MERGE" = "y" ]; then
-        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' > "$TEMP_DIR/aggregated_cidr_list"
+        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' > "$AGGREGATED_CIDR_LIST"
     elif command -v aggregate >/dev/null && [ -s "$IP_LIST" ]; then
-        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' | aggregate -q > "$TEMP_DIR/aggregated_cidr_list"
+        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' | aggregate -q > "$AGGREGATED_CIDR_LIST"
     else
-        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' > "$TEMP_DIR/aggregated_cidr_list"
-        merge_cidrs_bash "$AGGREGATED_CIDR_LIST" "$AGGREGATED_CIDR_LIST.tmp"
-        mv "$AGGREGATED_CIDR_LIST.tmp" "$AGGREGATED_CIDR_LIST"
+        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' > "$AGGREGATED_CIDR_LIST.tmp"
+        merge_cidrs_bash "$AGGREGATED_CIDR_LIST.tmp" "$AGGREGATED_CIDR_LIST"
+        rm -f "$AGGREGATED_CIDR_LIST.tmp"
     fi
-    mv "$TEMP_DIR/aggregated_cidr_list" "$AGGREGATED_CIDR_LIST"
+    
     # IPv6 aggregation
     if [ "$IPV6_ENABLED" -eq 1 ]; then
         if [ "$NO_IPV6_MERGE" = "y" ]; then
@@ -1721,9 +1725,9 @@ update_blocklist() {
         elif command -v aggregate6 >/dev/null && [ -s "$IP_LIST" ]; then
             grep '^inet6' "$IP_LIST" | cut -d' ' -f2 | aggregate6 -q > "$AGGREGATED_CIDR_LIST_V6"
         else
-            grep '^inet6' "$IP_LIST" | cut -d' ' -f2 > "$AGGREGATED_CIDR_LIST_V6"
-            merge_cidrs_bash_ipv6 "$AGGREGATED_CIDR_LIST_V6" "$AGGREGATED_CIDR_LIST_V6.tmp"
-            mv "$AGGREGATED_CIDR_LIST_V6.tmp" "$AGGREGATED_CIDR_LIST_V6"
+            grep '^inet6' "$IP_LIST" | cut -d' ' -f2 > "$AGGREGATED_CIDR_LIST_V6.tmp"
+            merge_cidrs_bash_ipv6 "$AGGREGATED_CIDR_LIST_V6.tmp" "$AGGREGATED_CIDR_LIST_V6"
+            rm -f "$AGGREGATED_CIDR_LIST_V6.tmp"
         fi
     fi
     # Verify iptables chain
@@ -1852,6 +1856,135 @@ update_blocklist() {
     END_TIME=$(date +%s)
     RUNTIME=$((END_TIME - START_TIME))
     echo "Blocklist update completed in $RUNTIME seconds" >&2
+}
+
+# Function to display status of ipset/nftables sets and iptables/nftables rules
+show_status() {
+    check_sudo
+    echo "=== Blocklist Status (at $(date)) ==="
+
+    # Determine firewall backend and set/chain names
+    local set_name_ipv4="$IPSET_NAME"
+    local set_name_ipv6="${IPSET_NAME}_v6"
+    local chain="$IPTABLES_CHAIN"
+    local total_entries=0
+
+    # ipset/nftables sets
+    echo -e "\n--- Blocklist Sets ---"
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        # IPv4 ipset
+        if sudo ipset list "$set_name_ipv4" >/dev/null 2>&1; then
+            local count_ipv4=$(sudo ipset list "$set_name_ipv4" | grep -E '^[0-9]' | wc -l)
+            total_entries=$((total_entries + count_ipv4))
+            echo "Set: $set_name_ipv4 (IPv4)"
+            echo "Entries: $count_ipv4"
+            # Show sample entries (up to 5) for user verification
+            echo "Sample Entries (up to 5):"
+            sudo ipset list "$set_name_ipv4" | grep -E '^[0-9]' | head -n 5 || echo "(None)"
+            [ $count_ipv4 -gt 5 ] && echo "... (showing first 5 entries, total: $count_ipv4)"
+        else
+            echo "Set: $set_name_ipv4 (IPv4, not found)"
+        fi
+        # IPv6 ipset
+        if [ "$IPV6_ENABLED" -eq 1 ]; then
+            if sudo ipset list "$set_name_ipv6" >/dev/null 2>&1; then
+                local count_ipv6=$(sudo ipset list "$set_name_ipv6" | grep -E '^[0-9a-fA-F]' | wc -l)
+                total_entries=$((total_entries + count_ipv6))
+                echo "Set: $set_name_ipv6 (IPv6)"
+                echo "Entries: $count_ipv6"
+                echo "Sample Entries (up to 5):"
+                sudo ipset list "$set_name_ipv6" | grep -E '^[0-9a-fA-F]' | head -n 5 || echo "(None)"
+                [ $count_ipv6 -gt 5 ] && echo "... (showing first 5 entries, total: $count_ipv6)"
+            else
+                echo "Set: $set_name_ipv6 (IPv6, not found)"
+            fi
+        else
+            echo "Set: $set_name_ipv6 (IPv6, disabled)"
+        fi
+    else
+        # nftables IPv4 set
+        if sudo nft list set ip filter "$set_name_ipv4" >/dev/null 2>&1; then
+            local count_ipv4=$(sudo nft list set ip filter "$set_name_ipv4" | grep -E '^[[:space:]]+[0-9]' | wc -l)
+            total_entries=$((total_entries + count_ipv4))
+            echo "Set: $set_name_ipv4 (IPv4)"
+            echo "Entries: $count_ipv4"
+            echo "Sample Entries (up to 5):"
+            sudo nft list set ip filter "$set_name_ipv4" | grep -E '^[[:space:]]+[0-9]' | head -n 5 || echo "(None)"
+            [ $count_ipv4 -gt 5 ] && echo "... (showing first 5 entries, total: $count_ipv4)"
+        else
+            echo "Set: $set_name_ipv4 (IPv4, not found)"
+        fi
+        # nftables IPv6 set
+        if [ "$IPV6_ENABLED" -eq 1 ]; then
+            if sudo nft list set ip6 filter "$set_name_ipv6" >/dev/null 2>&1; then
+                local count_ipv6=$(sudo nft list set ip6 filter "$set_name_ipv6" | grep -E '^[[:space:]]+[0-9a-fA-F]' | wc -l)
+                total_entries=$((total_entries + count_ipv6))
+                echo "Set: $set_name_ipv6 (IPv6)"
+                echo "Entries: $count_ipv6"
+                echo "Sample Entries (up to 5):"
+                sudo nft list set ip6 filter "$set_name_ipv6" | grep -E '^[[:space:]]+[0-9a-fA-F]' | head -n 5 || echo "(None)"
+                [ $count_ipv6 -gt 5 ] && echo "... (showing first 5 entries, total: $count_ipv6)"
+            else
+                echo "Set: $set_name_ipv6 (IPv6, not found)"
+            fi
+        else
+            echo "Set: $set_name_ipv6 (IPv6, disabled)"
+        fi
+    fi
+
+    # iptables/nftables rules
+    echo -e "\n--- Firewall Rules ---"
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        # iptables rules
+        if sudo iptables -L "$chain" -v -n >/dev/null 2>&1; then
+            echo "Chain: $chain (IPv4)"
+            sudo iptables -L "$chain" -v -n --line-numbers | grep -E "match-set $set_name_ipv4|Chain $chain" || echo "(No blocklist rules)"
+        else
+            echo "Chain: $chain (IPv4, not found)"
+        fi
+        # ip6tables rules
+        if [ "$IPV6_ENABLED" -eq 1 ]; then
+            if sudo ip6tables -L "$chain" -v -n >/dev/null 2>&1; then
+                echo "Chain: $chain (IPv6)"
+                sudo ip6tables -L "$chain" -v -n --line-numbers | grep -E "match-set $set_name_ipv6|Chain $chain" || echo "(No blocklist rules)"
+            else
+                echo "Chain: $chain (IPv6, not found)"
+            fi
+        else
+            echo "Chain: $chain (IPv6, disabled)"
+        fi
+    else
+        # nftables IPv4 rules
+        if sudo nft list chain ip filter "$chain" >/dev/null 2>&1; then
+            echo "Chain: $chain (IPv4)"
+            sudo nft list chain ip filter "$chain" | grep -E "set $set_name_ipv4|chain $chain" || echo "(No blocklist rules)"
+        else
+            echo "Chain: $chain (IPv4, not found)"
+        fi
+        # nftables IPv6 rules
+        if [ "$IPV6_ENABLED" -eq 1 ]; then
+            if sudo nft list chain ip6 filter "$chain" >/dev/null 2>&1; then
+                echo "Chain: $chain (IPv6)"
+                sudo nft list chain ip6 filter "$chain" | grep -E "set $set_name_ipv6|chain $chain" || echo "(No blocklist rules)"
+            else
+                echo "Chain: $chain (IPv6, not found)"
+            fi
+        else
+            echo "Chain: $chain (IPv6, disabled)"
+        fi
+    fi
+
+    # Summary
+    echo -e "\n--- Summary ---"
+    echo "Total Entries: $total_entries"
+    echo "Firewall Backend: $FIREWALL_BACKEND"
+    echo "IPv6 Processing: $( [ "$IPV6_ENABLED" -eq 1 ] && echo "Enabled" || echo "Disabled" )"
+
+    echo -e "\n=== End of Status ==="
+    # Log the status output if logging is enabled
+    if [ "$LOGGING_ENABLED" -eq 1 ]; then
+        echo "Displayed status at $(date)" >> "$LOG_FILE"
+    fi
 }
 
 # Main script
@@ -1995,6 +2128,11 @@ while [ $# -gt 0 ]; do
         --ipset-test)
             IPSET_TEST=1
             shift
+            ;;
+            --status)
+            load_config
+            show_status
+            exit 0
             ;;
         *)
             echo "Unknown option: $1" >&2
