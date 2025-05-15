@@ -42,7 +42,7 @@
 # Most current version as of this edit: 4.6.4
 
 # Supports iptables/nftables, IPv4/IPv6, multiple blocklist sources, and configurable settings
-# Version 4.6.3: Enhanced debug output, improved temp file management, added verification for ipset existence after application, fixed error handling in download and config management, updated output to show first/last lines of merged CIDR list.
+# Version 4.6.4: Added --purge-all option to remove all rules, ipsets, configs, and credentials; added --update-readme to update README file; added --update-configfile to manage config file updates with backup; improved iptables/ip6tables chain verification and creation; enhanced logging with backup and warnings; improved debug output for rule and set deletion; enforced stricter argument validation for --purge and --purge-all; updated README generation to reflect new features.
 
 # Inspired from https://lowendspirit.com/discussion/7699/use-a-blacklist-of-bad-ips-on-your-linux-firewall-tutorial
 # Credit to user itsdeadjim ( https://lowendspirit.com/profile/itsdeadjim )
@@ -132,15 +132,84 @@ if [ ! -w "$SCRIPT_DIR" ]; then
     echo "Warning: Script directory ($SCRIPT_DIR) is not writable; placing help file in $HELP_FILE" >&2
 fi
 
-# Generate blocklist_readme.md if it doesn't exist
-if [ ! -f "$HELP_FILE" ]; then
-    # Generate help file
-    if ! touch "$HELP_FILE" 2>/dev/null; then
-        echo "Error: Cannot write to $HELP_FILE" >&2
+update_configfile() {
+    # Check for the existence of a backup config file
+    local backup_file="$CONFIG_FILE.bak"
+    if [ -f "$backup_file" ]; then
+        echo "INFO: config.conf.bak found in $(dirname "$backup_file")/" >&2
+    else
+        echo "INFO: No backup config file found in $(dirname "$backup_file")/" >&2
+    fi
+
+    # Present the menu
+    echo "What do you want to do:" >&2
+    echo "(U|u) Update the config file, backing up the old version (WARNING: any previous backups will be overridden!)" >&2
+    echo "(C|c) View Current config file" >&2
+    echo "(O|o) View Old config file backup" >&2
+    echo "(Press any other key to exit)" >&2
+
+    # Read user choice
+    local choice
+    if [ "$NON_INTERACTIVE" -eq 1 ]; then
+        echo "Non-interactive mode: exiting as no action can be taken without user input" >&2
+        return 0
+    fi
+    read -p "Your choice (U/C/O): " choice </dev/tty
+
+    # Handle user choice
+    case "$choice" in
+        U|u)
+            if [ ! -f "$CONFIG_FILE" ]; then
+                echo "Error: Config file $CONFIG_FILE does not exist" >&2
+                exit 1
+            fi
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Backing up $CONFIG_FILE to $backup_file" >&2
+            cp -f "$CONFIG_FILE" "$backup_file" || {
+                echo "Error: Failed to create backup of $CONFIG_FILE to $backup_file" >&2
+                exit 1
+            }
+            chmod 600 "$backup_file" 2>/dev/null
+            echo "Backup of config file created at $backup_file" >&2
+            if [ -f "$backup_file" ]; then
+                rm -f "$CONFIG_FILE" || {
+                    echo "Error: Failed to delete $CONFIG_FILE after backup" >&2
+                    exit 1
+                }
+            fi
+            echo "INFO: Re-launch the script to generate the new config file" >&2
+            echo "You can compare the backup ($backup_file) with the new config to merge your changes" >&2
+            ;;
+        C|c)
+            if [ ! -f "$CONFIG_FILE" ]; then
+                echo "Error: Config file $CONFIG_FILE does not exist" >&2
+                exit 1
+            fi
+            echo "Current config file ($CONFIG_FILE):" >&2
+            cat "$CONFIG_FILE" >&2
+            ;;
+        O|o)
+            if [ ! -f "$backup_file" ]; then
+                echo "Error: Backup config file $backup_file does not exist" >&2
+                exit 1
+            fi
+            echo "Old config file backup ($backup_file):" >&2
+            cat "$backup_file" >&2
+            ;;
+        *)
+            echo "Exiting" >&2
+            return 0
+            ;;
+    esac
+}
+
+update_readme() {
+    local readme_file="$HELP_FILE"
+    if ! touch "$readme_file" 2>/dev/null; then
+        echo "Error: Cannot write to $readme_file" >&2
         exit 1
     fi
-    cat > "$HELP_FILE" << 'EOF'
-# Blocklist Update Script
+    cat > "$readme_file" << 'EOF'
+# Blocklist Update Script (v4.6.4)
 Manages IPv4/IPv6 blocklists for Linux firewalls using iptables/ipset or nftables.
 
 ## Features
@@ -152,6 +221,8 @@ Manages IPv4/IPv6 blocklists for Linux firewalls using iptables/ipset or nftable
 - Progress bars with pv, syntax checks, and detailed debugging (--debug, --verbosedebug).
 - Non-interactive mode and cron support for automation.
 - Robust IPv4/IPv6 CIDR merging, with optional aggregate/aggregate6 for speed.
+- Complete purge of rules, ipsets, configs, and credentials (--purge-all).
+- README updating for version consistency (--update-readme).
 
 ## Installation
 On a Debian-based system, install dependencies and prepare the script:
@@ -159,6 +230,7 @@ On a Debian-based system, install dependencies and prepare the script:
 sudo apt-get install wget gunzip awk iptables ipset
 # Optional for progress bars and faster merging
 sudo apt-get install pv aggregate aggregate6
+# Enable script execution with:
 chmod +x blocklistsupdate.sh
 
 Notes:
@@ -169,20 +241,42 @@ Notes:
 ## Usage
 1. Configure blocklist sources:
 ./blocklistsupdate.sh --config
-1. Update and apply blocklists:
+2. Update and apply blocklists:
 ./blocklistsupdate.sh
-1. Toggle rules without rebuilding ipsets:
+3. Toggle rules without rebuilding ipsets:
 ./blocklistsupdate.sh --clear-rules
 ./blocklistsupdate.sh --apply-rules
-1. View full options:
+4. Purge all data (add -y to purge immediately without prompting):
+./blocklistsupdate.sh --purge-all
+5. Update README:
+./blocklistsupdate.sh --update-readme
+6. View full options:
 ./blocklistsupdate.sh --help
 
 ## Configuration
 - Edit ~/.blocklist.conf for defaults (e.g., CONFIG_DIR, IPSET_NAME).
 - Add blocklist sources in ~/.blocklists/*.conf with URL and (if needed) USERNAME, PIN.
 - Use --auth to manage credentials for authenticated sources.
+- Log file: ~/blocklistsupdate.log (or custom with --config-dir).
 EOF
-    echo "Help file not found; generated $HELP_FILE" >&2
+    if [ $? -eq 0 ]; then
+        echo "README updated at $readme_file" >&2
+        chmod 600 "$readme_file" 2>/dev/null
+    else
+        echo "Error: Failed to write README to $readme_file" >&2
+        exit 1
+    fi
+}
+
+# Generate blocklist_readme.md if it doesn't exist
+if [ ! -f "$HELP_FILE" ]; then
+    # Generate help file
+    if ! touch "$HELP_FILE" 2>/dev/null; then
+        echo "Error: Cannot write to $HELP_FILE" >&2
+        exit 1
+    fi
+    echo "Help file not found; creating $HELP_FILE" >&2
+    update_readme
 fi
 
 # Capture and display start time for runtime calculation and user reference
@@ -226,28 +320,32 @@ show_help() {
     echo "Blocklist management script for Linux firewalls (iptables/nftables, IPv4/IPv6)"
     echo "Usage: $0 [--debug-level=1|2] [--log] [--dry-run] [--no-ipv4-merge] [--no-ipv6-merge] [--non-interactive]"
     echo "Options:"
-    echo "  --help        Display this help message"
-    echo "  --config      Manage blocklist config files (add, edit, delete, view)"
-    echo "  --auth        Edit or clear credentials"
-    echo "  --config-dir  Override default config directory (~/.blocklists)"
-    echo "  --purge       Remove blocklist rules and ipsets; optionally delete configs"
-    echo "  --clear-rules Remove blocklist rules, keeping ipsets for fast reapplication"
-    echo "  --apply-rules Re-apply blocklist rules from configs"
+    echo "  --help            Display this help message"
+    echo "  --config          Manage blocklist config files (add, edit, delete, view)"
+    echo "  --auth            Edit or clear credentials"
+    echo "  --config-dir=/path  Override default config directory (~/.blocklists)"
+    echo "  --purge           Remove blocklist rules and ipsets; optionally delete configs"
+    echo "  --purge-all [-y]  Remove all rules, ipsets, configs, and credentials (use -y to skip prompt)"
+    echo "  --clear-rules     Remove blocklist rules, keeping ipsets (re-enable with --apply-rules)"
+    echo "  --apply-rules     Re-apply blocklist rules from configs"
+    echo "  --update-readme   Update the README file to the version included with this script"
+    echo "  --update-configfile  Update the config file (backing up current) or view current or backup config file"
     echo "  --debug-level=1, --debug  Enable basic debug output (includes syntax check)"
     echo "  --debug-level=2, --verbosedebug  Enable verbose debug (adds script tracing to basic debug)"
-    echo "  --log         Log output to $LOG_FILE"
-    echo "  --dry-run     Simulate blocklist update without making changes"
-    echo "  --ipv6        Process IPv6 addresses (default: IPv4 only)"
-    echo "  --no-ipv4-merge  Skip IPv4 CIDR merging"
-    echo "  --no-ipv6-merge  Skip IPv6 CIDR merging"
-    echo "  --backend     Set firewall backend (iptables/nftables, default: $FIREWALL_BACKEND)"
+    echo "  --log             Log output to $LOG_FILE"
+    echo "  --dry-run         Simulate blocklist update without making changes"
+    echo "  --ipv6            Process IPv6 addresses (default: IPv4 only)"
+    echo "  --no-ipv4-merge   Skip IPv4 CIDR merging"
+    echo "  --no-ipv6-merge   Skip IPv6 CIDR merging"
+    echo "  --backend=iptables|nftables  Set firewall backend (default: $FIREWALL_BACKEND)"
     echo "  --non-interactive  Run without user prompts, using config defaults"
-    echo "  --ipset-test  Check for duplicates in ipset (adds ~5-10 seconds for 1,500 duplicates)"
+    echo "  --ipset-test      Check for duplicates in ipset (adds ~5-10 seconds for 1,500 duplicates)"
     echo "Requirements:"
     echo "  - Required: wget, gunzip, awk, and either (iptables and ipset) or nftables"
     echo "  - Recommended: pv (progress bars), aggregate/aggregate6 (faster merging)"
     echo "Notes:"
     echo "  - Configs stored in $CONFIG_DIR/*.conf"
+    echo "  - Log file: ~/blocklistsupdate.log (or custom with --config-dir)"
 }
 
 # Check for required dependencies
@@ -284,9 +382,17 @@ check_dependencies() {
     done
     # Kernel module check for ipset
     if [ "$FIREWALL_BACKEND" = "iptables" ]; then
-        if ! modprobe ip_set >/dev/null 2>&1; then
-            echo "Warning: ipset kernel module not available" >&2
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Checking ipset kernel module" >&2
+        if ! sudo modprobe ip_set >/dev/null 2>&1; then
+            echo "Error: Failed to load ipset kernel module (ip_set). Ensure it is installed and available." >&2
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: modprobe ip_set output: $(sudo modprobe ip_set 2>&1)" >&2
+            exit 1
         fi
+        if ! lsmod | grep -q ip_set; then
+            echo "Error: ipset kernel module (ip_set) not loaded. Ensure it is installed and available." >&2
+            exit 1
+        fi
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: ipset kernel module (ip_set) is loaded" >&2
     fi
 }
 
@@ -534,31 +640,87 @@ manage_configs() {
 
 # Purge blocklist setup
 purge_blocklist() {
-   check_sudo
-   if [ "$NON_INTERACTIVE" -eq 0 ]; then
-       echo "(configs and credentials will be preserved unless removed in the next step)" >&2
-       read -p "Confirm, you want to remove blocklist rules and ipsets? (y/N): " confirm_purge </dev/tty
-       if [[ ! "$confirm_purge" =~ ^[Yy]$ ]]; then
-           echo "Purge aborted; no changes made" >&2
-           exit 0
-       fi
-   else
-       echo "Non-interactive mode: Proceeding with purge of blocklist rules and ipsets" >&2
-   fi
+    check_sudo
+    if [ "$NON_INTERACTIVE" -eq 0 ]; then
+        echo "(configs and credentials will be preserved unless removed in the next step)" >&2
+        read -p "Confirm, you want to remove blocklist rules and ipsets? (y/N): " confirm_purge </dev/tty
+        if [[ ! "$confirm_purge" =~ ^[Yy]$ ]]; then
+            echo "Purge aborted; no changes made" >&2
+            exit 0
+        fi
+    else
+        echo "Non-interactive mode: Proceeding with purge of blocklist rules and ipsets" >&2
+    fi
     echo "Removing blocklist rules and ipsets..." >&2
     if [ "$FIREWALL_BACKEND" = "iptables" ]; then
-        sudo iptables -D "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>>"$LOG_FILE" || true
-        [ "$IPV6_ENABLED" -eq 1 ] && sudo ip6tables -D "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>>"$LOG_FILE" || true
-        sudo ipset destroy "$IPSET_NAME" 2>>"$LOG_FILE" || true
-        [ "$IPV6_ENABLED" -eq 1 ] && sudo ipset destroy "${IPSET_NAME}_v6" 2>>"$LOG_FILE" || true
+        if sudo iptables -C "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting iptables rule for $IPSET_NAME in $IPTABLES_CHAIN" >&2
+            sudo iptables -D "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete iptables rule for $IPSET_NAME: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: No iptables rule found for $IPSET_NAME in $IPTABLES_CHAIN" >&2
+        fi
+        if [ "$IPV6_ENABLED" -eq 1 ] && sudo ip6tables -C "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>/dev/null; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting ip6tables rule for ${IPSET_NAME}_v6 in $IPTABLES_CHAIN" >&2
+            sudo ip6tables -D "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete ip6tables rule for ${IPSET_NAME}_v6: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$IPV6_ENABLED" -eq 1 ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: No ip6tables rule found for ${IPSET_NAME}_v6 in $IPTABLES_CHAIN" >&2
+        fi
+        if sudo ipset list "$IPSET_NAME" >/dev/null 2>&1; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Destroying ipset $IPSET_NAME" >&2
+            sudo ipset destroy "$IPSET_NAME" 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to destroy ipset $IPSET_NAME: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: ipset $IPSET_NAME does not exist" >&2
+        fi
+        if [ "$IPV6_ENABLED" -eq 1 ] && sudo ipset list "${IPSET_NAME}_v6" >/dev/null 2>&1; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Destroying ipset ${IPSET_NAME}_v6" >&2
+            sudo ipset destroy "${IPSET_NAME}_v6" 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to destroy ipset ${IPSET_NAME}_v6: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$IPV6_ENABLED" -eq 1 ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: ipset ${IPSET_NAME}_v6 does not exist" >&2
+        fi
     else
-        sudo nft delete rule ip filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip filter "$IPTABLES_CHAIN" | grep "set $IPSET_NAME" | awk '{print $NF}') 2>>"$LOG_FILE" || true
-        [ "$IPV6_ENABLED" -eq 1 ] && sudo nft delete rule ip6 filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip6 filter "$IPTABLES_CHAIN" | grep "set ${IPSET_NAME}_v6" | awk '{print $NF}') 2>>"$LOG_FILE" || true
-        sudo nft delete set ip filter "$IPSET_NAME" 2>>"$LOG_FILE" || true
-        [ "$IPV6_ENABLED" -eq 1 ] && sudo nft delete set ip6 filter "${IPSET_NAME}_v6" 2>>"$LOG_FILE" || true
+        if sudo nft list chain ip filter "$IPTABLES_CHAIN" | grep -q "set $IPSET_NAME"; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting nftables rule for $IPSET_NAME in $IPTABLES_CHAIN" >&2
+            sudo nft delete rule ip filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip filter "$IPTABLES_CHAIN" | grep "set $IPSET_NAME" | awk '{print $NF}') 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete nftables rule for $IPSET_NAME: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: No nftables rule found for $IPSET_NAME in $IPTABLES_CHAIN" >&2
+        fi
+        if [ "$IPV6_ENABLED" -eq 1 ] && sudo nft list chain ip6 filter "$IPTABLES_CHAIN" | grep -q "set ${IPSET_NAME}_v6"; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting nftables rule for ${IPSET_NAME}_v6 in $IPTABLES_CHAIN" >&2
+            sudo nft delete rule ip6 filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip6 filter "$IPTABLES_CHAIN" | grep "set ${IPSET_NAME}_v6" | awk '{print $NF}') 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete nftables rule for ${IPSET_NAME}_v6: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$IPV6_ENABLED" -eq 1 ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: No nftables rule found for ${IPSET_NAME}_v6 in $IPTABLES_CHAIN" >&2
+        fi
+        if sudo nft list set ip filter "$IPSET_NAME" >/dev/null 2>&1; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting nftables set $IPSET_NAME" >&2
+            sudo nft delete set ip filter "$IPSET_NAME" 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete nftables set $IPSET_NAME: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: nftables set $IPSET_NAME does not exist" >&2
+        fi
+        if [ "$IPV6_ENABLED" -eq 1 ] && sudo nft list set ip6 filter "${IPSET_NAME}_v6" >/dev/null 2>&1; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting nftables set ${IPSET_NAME}_v6" >&2
+            sudo nft delete set ip6 filter "${IPSET_NAME}_v6" 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete nftables set ${IPSET_NAME}_v6: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$IPV6_ENABLED" -eq 1 ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: nftables set ${IPSET_NAME}_v6 does not exist" >&2
+        fi
     fi
     if [ "$NON_INTERACTIVE" -eq 0 ]; then
-       echo "Blocklist rules and ipsets removed; configs and credentials preserved." >&2
+        echo "Blocklist rules and ipsets removed; configs and credentials preserved." >&2
         read -p "Also delete configs and credentials in $CONFIG_DIR? (y/N): " delete_configs </dev/tty
         if [[ "$delete_configs" =~ ^[Yy]$ ]]; then
             rm -rf "$CONFIG_DIR" "$CRED_FILE"
@@ -567,7 +729,7 @@ purge_blocklist() {
             echo "Configs and credentials kept" >&2
         fi
     else
-       echo "Non-interactive mode: Configs and credentials preserved" >&2
+        echo "Non-interactive mode: Configs and credentials preserved" >&2
     fi
     echo "Blocklist purge complete" >&2
 }
@@ -585,13 +747,136 @@ clear_rules() {
     fi
     echo "Clearing blocklist firewall rules..." >&2
     if [ "$FIREWALL_BACKEND" = "iptables" ]; then
-        sudo iptables -D "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>>"$LOG_FILE" || true
-        [ "$IPV6_ENABLED" -eq 1 ] && sudo ip6tables -D "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>>"$LOG_FILE" || true
+        if sudo iptables -C "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting iptables rule for $IPSET_NAME in $IPTABLES_CHAIN" >&2
+            sudo iptables -D "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete iptables rule for $IPSET_NAME: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: No iptables rule found for $IPSET_NAME in $IPTABLES_CHAIN" >&2
+        fi
+        if [ "$IPV6_ENABLED" -eq 1 ] && sudo ip6tables -C "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>/dev/null; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting ip6tables rule for ${IPSET_NAME}_v6 in $IPTABLES_CHAIN" >&2
+            sudo ip6tables -D "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete ip6tables rule for ${IPSET_NAME}_v6: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$IPV6_ENABLED" -eq 1 ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: No ip6tables rule found for ${IPSET_NAME}_v6 in $IPTABLES_CHAIN" >&2
+        fi
     else
-        sudo nft delete rule ip filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip filter "$IPTABLES_CHAIN" | grep "set $IPSET_NAME" | awk '{print $NF}') 2>>"$LOG_FILE" || true
-        [ "$IPV6_ENABLED" -eq 1 ] && sudo nft delete rule ip6 filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip6 filter "$IPTABLES_CHAIN" | grep "set ${IPSET_NAME}_v6" | awk '{print $NF}') 2>>"$LOG_FILE" || true
+        if sudo nft list chain ip filter "$IPTABLES_CHAIN" | grep -q "set $IPSET_NAME"; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting nftables rule for $IPSET_NAME in $IPTABLES_CHAIN" >&2
+            sudo nft delete rule ip filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip filter "$IPTABLES_CHAIN" | grep "set $IPSET_NAME" | awk '{print $NF}') 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete nftables rule for $IPSET_NAME: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: No nftables rule found for $IPSET_NAME in $IPTABLES_CHAIN" >&2
+        fi
+        if [ "$IPV6_ENABLED" -eq 1 ] && sudo nft list chain ip6 filter "$IPTABLES_CHAIN" | grep -q "set ${IPSET_NAME}_v6"; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting nftables rule for ${IPSET_NAME}_v6 in $IPTABLES_CHAIN" >&2
+            sudo nft delete rule ip6 filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip6 filter "$IPTABLES_CHAIN" | grep "set ${IPSET_NAME}_v6" | awk '{print $NF}') 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete nftables rule for ${IPSET_NAME}_v6: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$IPV6_ENABLED" -eq 1 ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: No nftables rule found for ${IPSET_NAME}_v6 in $IPTABLES_CHAIN" >&2
+        fi
     fi
-    echo "Blocklist firewall rules cleared; ipsets preserved for fast reapplication" >&2
+    echo "Blocklist firewall rules cleared; ipsets preserved: re-enable with --apply-rules" >&2
+}
+
+purge_all() {
+    check_sudo
+    local confirm_purge_all="n"
+    if [ "$1" = "-y" ] || [ "$1" = "-Y" ]; then
+        confirm_purge_all="y"
+    fi
+    if [ "$NON_INTERACTIVE" -eq 1 ] && [ "$confirm_purge_all" != "y" ]; then
+        echo "Error: --purge-all in non-interactive mode requires -y to confirm" >&2
+        exit 1
+    fi
+    if [ "$NON_INTERACTIVE" -eq 0 ] && [ "$confirm_purge_all" != "y" ]; then
+        echo "WARNING: This will remove ALL blocklist rules, ipsets, configs, and credentials in $CONFIG_DIR and $CRED_FILE" >&2
+        read -p "Confirm purge of ALL blocklist data? (y/N): " confirm_purge_all </dev/tty
+        if [[ ! "$confirm_purge_all" =~ ^[Yy]$ ]]; then
+            echo "Purge-all aborted; no changes made" >&2
+            exit 0
+        fi
+    fi
+    echo "Purging all blocklist rules, ipsets, configs, and credentials..." >&2
+    # Reuse purge_blocklist's rule and ipset deletion logic
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        if sudo iptables -C "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting iptables rule for $IPSET_NAME in $IPTABLES_CHAIN" >&2
+            sudo iptables -D "$IPTABLES_CHAIN" -m set --match-set "$IPSET_NAME" src -j DROP 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete iptables rule for $IPSET_NAME: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: No iptables rule found for $IPSET_NAME in $IPTABLES_CHAIN" >&2
+        fi
+        if [ "$IPV6_ENABLED" -eq 1 ] && sudo ip6tables -C "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>/dev/null; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting ip6tables rule for ${IPSET_NAME}_v6 in $IPTABLES_CHAIN" >&2
+            sudo ip6tables -D "$IPTABLES_CHAIN" -m set --match-set "${IPSET_NAME}_v6" src -j DROP 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete ip6tables rule for ${IPSET_NAME}_v6: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$IPV6_ENABLED" -eq 1 ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: No ip6tables rule found for ${IPSET_NAME}_v6 in $IPTABLES_CHAIN" >&2
+        fi
+        if sudo ipset list "$IPSET_NAME" >/dev/null 2>&1; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Destroying ipset $IPSET_NAME" >&2
+            sudo ipset destroy "$IPSET_NAME" 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to destroy ipset $IPSET_NAME: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: ipset $IPSET_NAME does not exist" >&2
+        fi
+        if [ "$IPV6_ENABLED" -eq 1 ] && sudo ipset list "${IPSET_NAME}_v6" >/dev/null 2>&1; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Destroying ipset ${IPSET_NAME}_v6" >&2
+            sudo ipset destroy "${IPSET_NAME}_v6" 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to destroy ipset ${IPSET_NAME}_v6: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$IPV6_ENABLED" -eq 1 ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: ipset ${IPSET_NAME}_v6 does not exist" >&2
+        fi
+    else
+        if sudo nft list chain ip filter "$IPTABLES_CHAIN" | grep -q "set $IPSET_NAME"; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting nftables rule for $IPSET_NAME in $IPTABLES_CHAIN" >&2
+            sudo nft delete rule ip filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip filter "$IPTABLES_CHAIN" | grep "set $IPSET_NAME" | awk '{print $NF}') 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete nftables rule for $IPSET_NAME: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: No nftables rule found for $IPSET_NAME in $IPTABLES_CHAIN" >&2
+        fi
+        if [ "$IPV6_ENABLED" -eq 1 ] && sudo nft list chain ip6 filter "$IPTABLES_CHAIN" | grep -q "set ${IPSET_NAME}_v6"; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting nftables rule for ${IPSET_NAME}_v6 in $IPTABLES_CHAIN" >&2
+            sudo nft delete rule ip6 filter "$IPTABLES_CHAIN" handle $(sudo nft -a list chain ip6 filter "$IPTABLES_CHAIN" | grep "set ${IPSET_NAME}_v6" | awk '{print $NF}') 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete nftables rule for ${IPSET_NAME}_v6: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$IPV6_ENABLED" -eq 1 ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: No nftables rule found for ${IPSET_NAME}_v6 in $IPTABLES_CHAIN" >&2
+        fi
+        if sudo nft list set ip filter "$IPSET_NAME" >/dev/null 2>&1; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting nftables set $IPSET_NAME" >&2
+            sudo nft delete set ip filter "$IPSET_NAME" 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete nftables set $IPSET_NAME: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: nftables set $IPSET_NAME does not exist" >&2
+        fi
+        if [ "$IPV6_ENABLED" -eq 1 ] && sudo nft list set ip6 filter "${IPSET_NAME}_v6" >/dev/null 2>&1; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting nftables set ${IPSET_NAME}_v6" >&2
+            sudo nft delete set ip6 filter "${IPSET_NAME}_v6" 2>>"$LOG_FILE" || {
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete nftables set ${IPSET_NAME}_v6: $(tail -n 1 "$LOG_FILE")" >&2
+            }
+        else
+            [ "$IPV6_ENABLED" -eq 1 ] && [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: nftables set ${IPSET_NAME}_v6 does not exist" >&2
+        fi
+    fi
+    # Delete configs and credentials
+    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Deleting configs in $CONFIG_DIR and credentials in $CRED_FILE" >&2
+    rm -rf "$CONFIG_DIR" "$CRED_FILE" 2>>"$LOG_FILE" || {
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Failed to delete configs or credentials: $(tail -n 1 "$LOG_FILE")" >&2
+    }
+    echo "All blocklist rules, ipsets, configs, and credentials purged" >&2
 }
 
 # Load credentials
@@ -1104,12 +1389,24 @@ apply_set() {
 backup_set() {
     local set_name="$1"
     if [ "$FIREWALL_BACKEND" = "iptables" ]; then
-        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Backing up ipset $set_name to $IPSET_BACKUP_FILE" >&2
-        sudo ipset save "$set_name" -file "$IPSET_BACKUP_FILE" 2>>"$LOG_FILE"
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Checking if ipset $set_name exists before backup" >&2
+        if sudo ipset list "$set_name" >/dev/null 2>&1; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Backing up ipset $set_name to $IPSET_BACKUP_FILE" >&2
+            sudo ipset save "$set_name" -file "$IPSET_BACKUP_FILE" 2>>"$LOG_FILE" || {
+                echo "Warning: Failed to back up ipset $set_name" >&2
+            }
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: ipset $set_name does not exist; no backup needed" >&2
+        fi
     else
-        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Backing up nft set $set_name to $IPSET_BACKUP_FILE" >&2
-        sudo nft list set ip filter "$set_name" > "$IPSET_BACKUP_FILE" 2>>"$LOG_FILE" || \
-        sudo nft list set ip6 filter "$set_name" > "$IPSET_BACKUP_FILE" 2>>"$LOG_FILE"
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Checking if nft set $set_name exists before backup" >&2
+        if sudo nft list set ip filter "$set_name" >/dev/null 2>&1 || sudo nft list set ip6 filter "$set_name" >/dev/null 2>&1; then
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Backing up nft set $set_name to $IPSET_BACKUP_FILE" >&2
+            sudo nft list set ip filter "$set_name" > "$IPSET_BACKUP_FILE" 2>>"$LOG_FILE" || \
+            sudo nft list set ip6 filter "$set_name" > "$IPSET_BACKUP_FILE" 2>>"$LOG_FILE"
+        else
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: nft set $set_name does not exist; no backup needed" >&2
+        fi
     fi
 }
 
@@ -1117,25 +1414,17 @@ backup_set() {
 apply_rule() {
     local family="$1" set_name="$2"
     if [ "$FIREWALL_BACKEND" = "iptables" ]; then
-        if ipset list "$set_name" >/dev/null 2>&1; then
-            [ "$(ipset list "$set_name" | grep -c '^Name:')" -eq 0 ] && { echo "ERROR: IP set $set_name is empty" >&2; return 1; }
-            if [ "$family" = "inet" ]; then
-                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Checking/adding iptables rule for $set_name" >&2
-                sudo iptables -C "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP 2>/dev/null || \
-                sudo iptables -I "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP || {
-                    echo "ERROR: Failed to add iptables rule for $set_name" >&2
-                    return 1
-                }
-            else
-                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Checking/adding ip6tables rule for $set_name" >&2
-                sudo ip6tables -C "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP 2>/dev/null || \
-                sudo ip6tables -I "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP || {
-                    echo "ERROR: Failed to add ip6tables rule for $set_name" >&2
-                    return 1
-                }
-            fi
+        if sudo ipset list "$set_name" >/dev/null 2>&1; then
+            [ "$(sudo ipset list "$set_name" | grep -c '^Name:')" -eq 0 ] && { echo "ERROR: IP set $set_name is empty" >&2; return 1; }
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Checking/adding iptables rule for $set_name" >&2
+            sudo iptables -C "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP 2>/dev/null || \
+            sudo iptables -I "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP || {
+                echo "ERROR: Failed to add iptables rule for $set_name" >&2
+                return 1
+            }
         else
             echo "ERROR: IP set $set_name does not exist or is inaccessible" >&2
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: ipset list output: $(sudo ipset list "$set_name" 2>&1)" >&2
             return 1
         fi
     else
@@ -1155,6 +1444,7 @@ apply_rule() {
             fi
         else
             echo "ERROR: NFT set $set_name does not exist" >&2
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: nft list set output: $(nft list set "$family" filter "$set_name" 2>&1)" >&2
             return 1
         fi
     fi
@@ -1436,6 +1726,67 @@ update_blocklist() {
             mv "$AGGREGATED_CIDR_LIST_V6.tmp" "$AGGREGATED_CIDR_LIST_V6"
         fi
     fi
+    # Verify iptables chain
+    if [ "$FIREWALL_BACKEND" = "iptables" ]; then
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Verifying iptables chain $IPTABLES_CHAIN exists" >&2
+        if ! sudo iptables -L "$IPTABLES_CHAIN" >/dev/null 2>&1; then
+            echo "Warning: iptables chain $IPTABLES_CHAIN does not exist" >&2
+            if [ "$NON_INTERACTIVE" -eq 0 ]; then
+                read -p "Create chain $IPTABLES_CHAIN? (y/N): " create_chain </dev/tty
+                if [[ "$create_chain" =~ ^[Yy]$ ]]; then
+                    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Creating iptables chain $IPTABLES_CHAIN" >&2
+                    sudo iptables -N "$IPTABLES_CHAIN" || {
+                        echo "Error: Failed to create iptables chain $IPTABLES_CHAIN" >&2
+                        exit 1
+                    }
+                    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: iptables chain $IPTABLES_CHAIN created successfully" >&2
+                else
+                    echo "Aborted due to missing iptables chain" >&2
+                    exit 1
+                fi
+            elif [ "$NON_INTERACTIVE_CREATE_CHAIN" = "y" ]; then
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Non-interactive mode: Creating iptables chain $IPTABLES_CHAIN" >&2
+                sudo iptables -N "$IPTABLES_CHAIN" || {
+                    echo "Error: Failed to create iptables chain $IPTABLES_CHAIN" >&2
+                    exit 1
+                }
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: iptables chain $IPTABLES_CHAIN created successfully" >&2
+            else
+                echo "Error: iptables chain $IPTABLES_CHAIN does not exist and non-interactive mode prevents creation" >&2
+                exit 1
+            fi
+        fi
+        [ "$IPV6_ENABLED" -eq 1 ] && {
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Verifying ip6tables chain $IPTABLES_CHAIN exists" >&2
+            if ! sudo ip6tables -L "$IPTABLES_CHAIN" >/dev/null 2>&1; then
+                echo "Warning: ip6tables chain $IPTABLES_CHAIN does not exist" >&2
+                if [ "$NON_INTERACTIVE" -eq 0 ]; then
+                    read -p "Create ip6tables chain $IPTABLES_CHAIN? (y/N): " create_chain_v6 </dev/tty
+                    if [[ "$create_chain_v6" =~ ^[Yy]$ ]]; then
+                        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Creating ip6tables chain $IPTABLES_CHAIN" >&2
+                        sudo ip6tables -N "$IPTABLES_CHAIN" || {
+                            echo "Error: Failed to create ip6tables chain $IPTABLES_CHAIN" >&2
+                            exit 1
+                        }
+                        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: ip6tables chain $IPTABLES_CHAIN created successfully" >&2
+                    else
+                        echo "Aborted due to missing ip6tables chain" >&2
+                        exit 1
+                    fi
+                elif [ "$NON_INTERACTIVE_CREATE_CHAIN" = "y" ]; then
+                    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Non-interactive mode: Creating ip6tables chain $IPTABLES_CHAIN" >&2
+                    sudo ip6tables -N "$IPTABLES_CHAIN" || {
+                        echo "Error: Failed to create ip6tables chain $IPTABLES_CHAIN" >&2
+                        exit 1
+                    }
+                    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: ip6tables chain $IPTABLES_CHAIN created successfully" >&2
+                else
+                    echo "Error: ip6tables chain $IPTABLES_CHAIN does not exist and non-interactive mode prevents creation" >&2
+                    exit 1
+                fi
+            fi
+        }
+    fi
     # Backup existing sets
     if [ -s "$IPSET_BACKUP_FILE" ]; then
         if [ "$NON_INTERACTIVE" -eq 0 ]; then
@@ -1464,6 +1815,37 @@ update_blocklist() {
     fi
     echo "IPv4 CIDRs after merging: $ipv4_count" >&2
     echo "IPv6 CIDRs after merging: $ipv6_count" >&2
+    
+    # Verify ipset and iptables rules in debug mode
+    if [ "$DEBUG_MODE" -eq 1 ]; then
+        echo "DEBUG: Listing current ipset rulesets" >&2
+        sudo ipset list -name | sed 's/^/DEBUG:   /' >&2 || {
+            echo "DEBUG: No ipset rulesets found" >&2
+        }
+        if [ -s "$AGGREGATED_CIDR_LIST" ]; then
+            echo "DEBUG: Verifying iptables rule for $IPSET_NAME" >&2
+            echo "DEBUG: iptables rule:" >&2
+            sudo iptables -L "$IPTABLES_CHAIN" -v -n | grep -E "match-set $IPSET_NAME src" | sed 's/^/DEBUG:   /' >&2 || {
+                echo "DEBUG: No iptables rule found for $IPSET_NAME in chain $IPTABLES_CHAIN" >&2
+            }
+            echo "DEBUG: Counting entries in ipset $IPSET_NAME..." >&2
+            local ipset_count
+            ipset_count=$(sudo ipset list "$IPSET_NAME" | grep -v '^Name:\|^Size\|^References:\|^Header:' | wc -l)
+            echo "DEBUG: ipset $IPSET_NAME contains $ipset_count entries" >&2
+        fi
+        if [ "$IPV6_ENABLED" -eq 1 ] && [ -s "$AGGREGATED_CIDR_LIST_V6" ]; then
+            echo "DEBUG: Verifying ip6tables rule for ${IPSET_NAME}_v6" >&2
+            echo "DEBUG: ip6tables rule:" >&2
+            sudo ip6tables -L "$IPTABLES_CHAIN" -v -n | grep -E "match-set ${IPSET_NAME}_v6 src" | sed 's/^/DEBUG:   /' >&2 || {
+                echo "DEBUG: No ip6tables rule found for ${IPSET_NAME}_v6 in chain $IPTABLES_CHAIN" >&2
+            }
+            echo "DEBUG: Counting entries in ipset ${IPSET_NAME}_v6..." >&2
+            local ipset_v6_count
+            ipset_v6_count=$(sudo ipset list "${IPSET_NAME}_v6" | grep -v '^Name:\|^Size\|^References:\|^Header:' | wc -l)
+            echo "DEBUG: ipset ${IPSET_NAME}_v6 contains $ipset_v6_count entries" >&2
+        fi
+    fi
+
     # Clean up temporary files
     rm -f "$AGGREGATED_CIDR_LIST" "$AGGREGATED_CIDR_LIST_V6"
     # Calculate and display runtime
@@ -1486,6 +1868,10 @@ DRY_RUN=0
 IPV6_ENABLED=0
 NON_INTERACTIVE=0
 IPSET_TEST=0
+PURGE_ALL="n"
+PURGE_ALL_CONFIRM="n"
+PURGE="n"
+UPDATE_README="n"
 
 # Parse command-line arguments
 while [ $# -gt 0 ]; do
@@ -1510,8 +1896,18 @@ while [ $# -gt 0 ]; do
             ;;
         --purge)
             load_config
-            purge_blocklist
-            exit 0
+            PURGE="y"
+            shift
+            ;;
+        --purge-all)
+            load_config
+            PURGE_ALL="y"
+            shift
+            # Check for -y/-Y
+            if [ "$1" = "-y" ] || [ "$1" = "-Y" ]; then
+                PURGE_ALL_CONFIRM="y"
+                shift
+            fi
             ;;
         --clear-rules)
             load_config
@@ -1524,6 +1920,16 @@ while [ $# -gt 0 ]; do
             apply_rule inet "$IPSET_NAME"
             [ "$IPV6_ENABLED" -eq 1 ] && apply_rule inet6 "${IPSET_NAME}_v6"
             echo "Blocklist rules reapplied" >&2
+            exit 0
+            ;;
+        --update-readme)
+            load_config
+            update_readme
+            exit 0
+            ;;
+        --update-configfile)
+            load_config
+            update_configfile
             exit 0
             ;;
         --debug-level=*)
@@ -1598,7 +2004,35 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Set up logging
+# Enforce allowed switches for --purge-all
+if [ "$PURGE_ALL" = "y" ]; then
+    for arg in "${ORIGINAL_ARGS[@]}"; do
+        case "$arg" in
+            --purge-all|-y|-Y|--debug|--verbosedebug|--debug-level=1|--debug-level=2|--log|--config-dir=*)
+                ;;
+            *)
+                echo "Error: --purge-all only allows --debug, --verbosedebug, --debug-level=1|2, --log, and --config-dir" >&2
+                exit 1
+                ;;
+        esac
+    done
+fi
+
+# Enforce allowed switches for --purge
+if [ "$PURGE" = "y" ]; then
+    for arg in "${ORIGINAL_ARGS[@]}"; do
+        case "$arg" in
+            --purge|--debug|--verbosedebug|--debug-level=1|--debug-level=2|--log|--config-dir=*)
+                ;;
+            *)
+                echo "Error: --purge only allows --debug, --verbosedebug, --debug-level=1|2, --log, and --config-dir" >&2
+                exit 1
+                ;;
+        esac
+    done
+fi
+
+# Load configuration
 load_config
 echo "CONFIG_DIR=$CONFIG_DIR" >&2
 
@@ -1629,13 +2063,46 @@ echo $$ > "$LOCK_DIR/pid"
 [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Created lock directory $LOCK_DIR with PID $$" >&2
 trap 'cleanup' EXIT INT TERM
 
+# Set up logging
 if [ "$LOGGING_ENABLED" -eq 1 ]; then
-    if ! touch "$LOG_FILE" 2>/dev/null; then
-        echo "Error: Cannot write to $LOG_FILE" >&2
-        exit 1
-    fi
-    chmod 600 "$LOG_FILE"
-    exec > >(tee -a "$LOG_FILE") 2>&1
+    # Skip logging for commands that exit immediately
+    case "${ORIGINAL_ARGS[*]}" in
+        *--help*|*--config*|*--auth*|*--purge*|*--clear-rules*|*--apply-rules*|*--ipset-test*|*--update-readme*|*--update-configfile*)
+            [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping log file creation for ${ORIGINAL_ARGS[*]}" >&2
+            ;;
+        *)
+            if ! touch "$LOG_FILE" 2>/dev/null; then
+                echo "Error: Cannot write to $LOG_FILE" >&2
+                exit 1
+            fi
+            chmod 600 "$LOG_FILE"
+            # Create backup of existing log file
+            if [ -f "$LOG_FILE" ]; then
+                cp -f "$LOG_FILE" "${LOG_FILE}.bak" && chmod 600 "${LOG_FILE}.bak" || {
+                    echo "Warning: Failed to create or set permissions for backup of $LOG_FILE to ${LOG_FILE}.bak" >&2
+                }
+                [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Created backup of $LOG_FILE to ${LOG_FILE}.bak" >&2
+            fi
+            # Warn if output is redirected
+            if [ ! -t 1 ]; then
+                echo "Warning: Output is already redirected (e.g., to a file); also logging to $LOG_FILE. Ctrl+C to cancel if undesired." >&2
+            fi
+            exec > >(tee -a "$LOG_FILE") 2>&1
+            echo "Logging to $LOG_FILE" >&2
+            ;;
+    esac
+fi
+
+# Handle --purge
+if [ "$PURGE" = "y" ]; then
+    purge_blocklist
+    exit 0
+fi
+
+# Handle --purge-all
+if [ "$PURGE_ALL" = "y" ]; then
+    purge_all "$PURGE_ALL_CONFIRM"
+    exit 0
 fi
 
 # Ensure root privileges
