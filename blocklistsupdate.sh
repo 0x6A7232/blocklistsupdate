@@ -42,7 +42,7 @@
 # Most current version as of this edit: 4.6.4
 
 # Supports iptables/nftables, IPv4/IPv6, multiple blocklist sources, and configurable settings
-# Version 4.0: Added CIDR merge prompts, dynamic ipset sizing, chunked ipset application, improved locking
+# Version 4.1: Enhanced sudo handling with re-launch option, improved root detection
 
 # Inspired from https://lowendspirit.com/discussion/7699/use-a-blacklist-of-bad-ips-on-your-linux-firewall-tutorial
 # Credit to user itsdeadjim ( https://lowendspirit.com/profile/itsdeadjim )
@@ -176,20 +176,40 @@ check_dependencies() {
     fi
 }
 
-# Verify sudo access
+# Verify sudo access, offering re-launch if sudo isn't passwordless
 check_sudo() {
+    if [ "$EUID" -eq 0 ]; then
+        # Already running as root (sudo)
+        return 0
+    fi
+
+    # Check if sudo is available without prompting
     if sudo -n true 2>/dev/null; then
         return 0
     fi
-    # Allow password prompt for interactive runs
+
+    # Interactive mode: Offer choice to re-launch or prompt as needed
     if [ "$NON_INTERACTIVE" -eq 0 ] && [ -z "$CRON" ]; then
-        echo "This script requires sudo access. You may be prompted for your password."
-        if sudo true; then
-            return 0
+        echo "This script requires sudo access."
+        read -p "Enter password as needed (p) or re-launch using sudo for uninterrupted runs (R or Enter)?: " choice
+        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: User chose sudo path: ${choice:-R}" >&2
+        if [[ "$choice" =~ ^[Rr]$ || -z "$choice" ]]; then
+            echo "Re-launching with sudo..."
+            # Preserve original arguments
+            exec sudo "$0" "$@"
+        else
+            echo "Will prompt for sudo password when needed."
+            if sudo true; then
+                return 0
+            else
+                echo "Error: Sudo authentication failed"
+                exit 1
+            fi
         fi
+    else
+        echo "Error: Sudo access required (non-interactive mode requires passwordless sudo)"
+        exit 1
     fi
-    echo "Error: Sudo access required (non-interactive mode requires passwordless sudo)"
-    exit 1
 }
 
 # Set up configuration directory
