@@ -42,7 +42,7 @@
 # Most current version as of this edit: 4.6.4
 
 # Supports iptables/nftables, IPv4/IPv6, multiple blocklist sources, and configurable settings
-# Version 4.6: Fixed ipset/nftables hangs, optimized parsing, improved error handling, enhanced user feedback, simplified arguments
+# Version 4.6.1: Fixed empty ipset issue, permission issues with temp files, improved logging with tee, reduced verbosity in verbosedebug
 
 # Inspired from https://lowendspirit.com/discussion/7699/use-a-blacklist-of-bad-ips-on-your-linux-firewall-tutorial
 # Credit to user itsdeadjim ( https://lowendspirit.com/profile/itsdeadjim )
@@ -192,19 +192,23 @@ echo "Script started at: $START_TIME_READABLE"
 
 # Create secure temporary files
 setup_temp_files() {
-    if ! [ -w /tmp ]; then
+    TEMP_DIR=$(mktemp -d "$CONFIG_DIR/tmp.XXXXXX") || { echo "Error: Failed to create temp directory"; exit 1; }
+    chmod 700 "$TEMP_DIR"
+    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Using temporary directory $TEMP_DIR" >&2
+    if ! [ -w "$TEMP_DIR" ]; then
         echo "Error: /tmp is not writable"
         exit 1
     fi
-    IP_LIST_RAW=$(mktemp /tmp/iplist_raw.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
-    IP_LIST=$(mktemp /tmp/iplist.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
-    IPSET_BACKUP_FILE=$(mktemp /tmp/ipset_backup.XXXXXX) || { echo "Error: Failed to create temp file"; exit 1; }
-    chmod 600 "$IP_LIST_RAW" "$IP_LIST" "$IPSET_BACKUP_FILE"
+    IP_LIST_RAW="$TEMP_DIR/iplist_raw"
+    IP_LIST="$TEMP_DIR/iplist"
+    IPSET_BACKUP_FILE="$TEMP_DIR/ipset_backup"
+    touch "$IP_LIST_RAW" "$IP_LIST" "$IPSET_BACKUP_FILE" || { echo "Error: Failed to create temp files"; exit 1; }
+    chmod 660 "$IP_LIST_RAW" "$IP_LIST" "$IPSET_BACKUP_FILE"
 }
 
 # Cleanup temporary files on exit
 cleanup() {
-    rm -f "$IP_LIST_RAW" "$IP_LIST" "$IPSET_RESTORE_FILE" "$IPSET_BACKUP_FILE" /tmp/iplist_*.conf.* /tmp/iplist_raw.* /tmp/iplist.* /tmp/ipset_commands.* /tmp/cidr_list.* /tmp/aggregated_cidr_list.* /tmp/wget_output /tmp/pv_output
+    rm -rf "$TEMP_DIR"
     [ "$DEBUG_MODE" -eq 1 ] && echo "Script exited at: $(date)"
 }
 
@@ -1089,6 +1093,7 @@ apply_rule() {
     local family="$1" set_name="$2"
     if [ "$FIREWALL_BACKEND" = "iptables" ]; then
         if ipset list "$set_name" >/dev/null 2>&1; then
+            [ "$(ipset list "$set_name" | grep -c '^Name:')" -eq 0 ] && { echo "ERROR: IP set $set_name is empty" >&2; return 1; }
             if [ "$family" = "inet" ]; then
                 [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Checking/adding iptables rule for $set_name" >&2
                 sudo iptables -C "$IPTABLES_CHAIN" -m set --match-set "$set_name" src -j DROP 2>/dev/null || \
@@ -1105,7 +1110,7 @@ apply_rule() {
                 }
             fi
         else
-            echo "ERROR: IP set $set_name does not exist" >&2
+            echo "ERROR: IP set $set_name does not exist or is inaccessible" >&2
             return 1
         fi
     else
@@ -1142,6 +1147,12 @@ apply_ipset() {
         rm -f "$tmp_script"
         return 0
     fi
+    # Debug: Show first 5 lines of ipset_file
+    [ "$DEBUG_MODE" -eq 1 ] && {
+        echo "DEBUG: First 5 lines of $ipset_file:" >&2
+        head -n 5 "$ipset_file" >&2
+    }
+    local actual_count=$(wc -l < "$ipset_file")
     check_sudo
     if [ "$FIREWALL_BACKEND" = "iptables" ]; then
         # Destroy existing set to avoid conflicts
@@ -1163,16 +1174,23 @@ apply_ipset() {
         # Populate ipset
         echo "flush $set_name" > "$tmp_script"
         local cidr_count=0
+        local was_set_x=0
+        [ "$VERBOSE_DEBUG" -eq 1 ] && { set +x; was_set_x=1; }
         if command -v pv >/dev/null; then
-            pv -f -N "Applying $family CIDRs to $set_name" -s "$expected_count" "$ipset_file" | while IFS= read -r cidr; do
+            while IFS= read -r cidr; do
                 [ -z "$cidr" ] && continue
-                if [ "$IPSET_TEST" -eq 1 ] && sudo ipset test "$set_name" "$cidr" 2>/dev/null; then
-                    [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping duplicate $family CIDR $cidr in $set_name" >&2
+                if validate_cidr "$cidr" "$family"; then
+                    if [ "$IPSET_TEST" -eq 1 ] && sudo ipset test "$set_name" "$cidr" 2>/dev/null; then
+                        [ "$DEBUG_MODE" -eq 1 ] && echo "DEBUG: Skipping duplicate $family CIDR $cidr in $set_name" >&2
+                    else
+                        echo "add $set_name $cidr" >> "$tmp_script"
+                        ((cidr_count++))
+                    fi
                 else
-                    echo "add $set_name $cidr" >> "$tmp_script"
+                    echo "Invalid $family CIDR skipped: $cidr" | tee -a "$LOG_FILE"
                 fi
-                ((cidr_count++))
-            done
+            done < <(pv -f -N "Applying $family CIDRs to $set_name" -s "$actual_count" "$ipset_file")
+        [ "$was_set_x" -eq 1 ] && set -x
         else
             while IFS= read -r cidr; do
                 [ -z "$cidr" ] && continue
@@ -1183,6 +1201,14 @@ apply_ipset() {
                 fi
                 ((cidr_count++))
             done < "$ipset_file"
+        fi
+        # Debug: Log tmp_script if no CIDRs applied
+        if [ "$cidr_count" -eq 0 ]; then
+            echo "ERROR: No valid CIDRs applied to $set_name" >&2
+            if [ "$DEBUG_MODE" -eq 1 ]; then
+                echo "DEBUG: Contents of $tmp_script:" >&2
+                cat "$tmp_script" >&2
+            fi
         fi
         # Apply ipset commands with chunking
         local ipset_output ipset_status chunk_size=100000 attempts=0 max_attempts=3
@@ -1338,11 +1364,11 @@ update_blocklist() {
     fi
     # IPv4 aggregation
     if [ "$NO_IPV4_MERGE" = "y" ]; then
-        grep '^inet' "$IP_LIST" | cut -d' ' -f2 > "$AGGREGATED_CIDR_LIST"
+        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' > "$AGGREGATED_CIDR_LIST"
     elif command -v aggregate >/dev/null && [ -s "$IP_LIST" ]; then
-        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | aggregate -q > "$AGGREGATED_CIDR_LIST"
+        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' | aggregate -q > "$AGGREGATED_CIDR_LIST"
     else
-        grep '^inet' "$IP_LIST" | cut -d' ' -f2 > "$AGGREGATED_CIDR_LIST"
+        grep '^inet' "$IP_LIST" | cut -d' ' -f2 | sed '/^[[:space:]]*$/d' > "$AGGREGATED_CIDR_LIST"
         merge_cidrs_bash "$AGGREGATED_CIDR_LIST" "$AGGREGATED_CIDR_LIST.tmp"
         mv "$AGGREGATED_CIDR_LIST.tmp" "$AGGREGATED_CIDR_LIST"
     fi
@@ -1510,8 +1536,7 @@ if [ "$LOGGING_ENABLED" -eq 1 ]; then
         exit 1
     fi
     chmod 600 "$LOG_FILE"
-    exec 1>>"$LOG_FILE"
-    exec 2>&1
+    exec > >(tee -a "$LOG_FILE") 2>&1
 fi
 
 # Trap cleanup on exit
